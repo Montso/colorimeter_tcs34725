@@ -34,6 +34,15 @@ enum OperatingMode : uint8_t {
   MODE_ABORT   = 3
 };
 
+// Top-level application state.
+//   APP_MENU_DRIVEN – full interactive serial menu (default).
+//   APP_POLLING     – no menu output; caller reads values via public getters.
+//                     Only 'b' (blank) and 'm' (return to menu) are handled.
+enum AppState : uint8_t {
+  APP_MENU_DRIVEN = 0,
+  APP_POLLING     = 1
+};
+
 class Colorimeter {
 public:
   static const uint8_t  NUM_BLANK_SAMPLES = 50;
@@ -49,6 +58,7 @@ public:
 
   Colorimeter()
     : _mode(MODE_MEASURE),
+      _app_state(APP_MENU_DRIVEN),
       _measurement_name(ABSORBANCE_STR),
       _is_blanked(false),
       _blank_value(1.0f),
@@ -137,9 +147,18 @@ public:
   }
 
   void update() {
-    _handleSerial();
-    _updateDisplay();
+    if (_app_state == APP_POLLING) {
+      _handlePollingSerial();
+    } else {
+      _handleSerial();
+      _updateDisplay();
+    }
   }
+
+  // ---- App-state control --------------------------------------------------
+
+  void     setAppState(AppState s) { _app_state = s; }
+  AppState getAppState()     const { return _app_state; }
 
   // ---- Measurement API ----------------------------------------------------
 
@@ -236,6 +255,7 @@ private:
   Calibrations      _calibrations;
 
   OperatingMode _mode;
+  AppState      _app_state;
   String        _measurement_name;
   bool          _is_blanked;
   float         _blank_value;
@@ -281,7 +301,25 @@ private:
            _measurement_name == RAW_BH1750_STR;
   }
 
-  // ---- Serial input -------------------------------------------------------
+  // ---- Serial input (polling mode) ----------------------------------------
+
+  void _handlePollingSerial() {
+    if (!Serial.available()) return;
+    char cmd = Serial.read();
+    uint32_t now = millis();
+    if ((now - _last_button_ms) < DEBOUNCE_DT_MS) return;
+    _last_button_ms = now;
+
+    if (cmd == 'b') {
+      blankSensor();
+    } else if (cmd == 'm') {
+      _app_state = APP_MENU_DRIVEN;
+      _mode      = MODE_MEASURE;
+      Serial.println("Switched to menu-driven mode");
+    }
+  }
+
+  // ---- Serial input (menu-driven mode) ------------------------------------
 
   void _handleSerial() {
     if (!Serial.available()) return;
@@ -294,7 +332,12 @@ private:
     switch (_mode) {
 
       case MODE_MEASURE:
-        if (cmd == 'b' && !_isRawView()) {
+        if (cmd == 'p') {
+          _app_state = APP_POLLING;
+          Serial.println("Switched to polling mode");
+          return;
+
+        } else if (cmd == 'b' && !_isRawView()) {
           blankSensor();
 
         } else if (cmd == 'm') {

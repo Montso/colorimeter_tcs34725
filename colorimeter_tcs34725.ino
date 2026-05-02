@@ -3,7 +3,7 @@
  * ESP32-S3 Colorimeter – main sketch
  *
  * Target : ESP32-S3 with 8 MB flash
- * Sensor : TCS34725 (I2C)
+ * Sensor : TCS34725 (I2C) and / or BH1750 (I2C)
  * Storage: LittleFS on internal flash (no SD card required)
  *
  * First-time setup
@@ -30,23 +30,32 @@
  *   ArduinoJson       – Benoit Blanchon       (v6 or v7)
  *   Adafruit TCS34725 – Adafruit Industries
  *
- * Serial commands (115 200 baud, no line ending)
- * -----------------------------------------------
- *   b  – blank sensor
- *   m  – toggle menu
- *   u  – menu up
- *   d  – menu down
- *   r  – select / right
- *   g  – cycle gain          (raw sensor mode only)
- *   i  – cycle integration time (raw sensor mode only)
+ * ============================================================
+ * APPLICATION MODE
+ * ============================================================
+ * Uncomment exactly one of the two lines below.
  *
- * Wiring
- * ------
- *   TCS34725 VCC → 3.3 V
- *   TCS34725 GND → GND
- *   TCS34725 SCL → GPIO 9  (or the board's default SCL)
- *   TCS34725 SDA → GPIO 8  (or the board's default SDA)
+ *   APP_MENU_DRIVEN  –  Full interactive serial menu.
+ *                       Serial commands (115 200 baud, no line ending):
+ *                         b  – blank sensor
+ *                         m  – toggle menu
+ *                         u  – menu up
+ *                         d  – menu down
+ *                         r  – select / right
+ *                         g  – cycle gain          (raw TCS34725 mode only)
+ *                         i  – cycle integration time (raw TCS34725 mode only)
+ *                         p  – switch to polling mode at runtime
+ *
+ *   APP_POLLING      –  No menu.  update() keeps sensors refreshed; your
+ *                       code calls public getters to read measurements.
+ *                       Serial commands (115 200 baud):
+ *                         b  – blank sensor
+ *                         m  – return to menu-driven mode at runtime
+ * ============================================================
  */
+
+#define STARTUP_MODE APP_MENU_DRIVEN
+// #define STARTUP_MODE APP_POLLING
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -57,34 +66,61 @@ Colorimeter colorimeter;
 
 void setup() {
   Serial.begin(115200);
-  delay(1500);  // time for the host terminal to connect
+  delay(1500);
 
   Serial.println("\n=== ESP32-S3 TCS34725 Colorimeter ===");
 
-  // ---- LittleFS -----------------------------------------------------------
-  // formatOnFail = true  → automatically formats a blank or corrupted partition
-  // on first boot so the device does not brick if the partition is uninitialised.
   if (!LittleFS.begin(true)) {
     Serial.println("FATAL: LittleFS mount failed");
-    Serial.println("Run 'ESP32 LittleFS Data Upload' from the Tools menu,");
-    Serial.println("then reset.");
+    Serial.println("Run 'ESP32 LittleFS Data Upload' from the Tools menu, then reset.");
     while (true) { delay(1000); }
   }
   Serial.println("LittleFS mounted");
 
-  // ---- Colorimeter --------------------------------------------------------
   if (!colorimeter.begin()) {
-    // begin() already set MODE_ABORT internally; the update loop will show
-    // the abort message.  We do not halt here so the Serial output is visible.
     Serial.println("Colorimeter init failed – running in abort mode");
   } else {
-    Serial.println("Colorimeter ready");
-    Serial.println("Commands: b=blank  m=menu  u=up  d=down  r=select");
-    Serial.println("          g=cycle gain  i=cycle itime  (last two: raw mode only)");
+    colorimeter.setAppState(STARTUP_MODE);
+
+    if (STARTUP_MODE == APP_POLLING) {
+      Serial.println("Colorimeter ready – POLLING mode");
+      Serial.println("Commands: b=blank  m=return to menu");
+    } else {
+      Serial.println("Colorimeter ready – MENU-DRIVEN mode");
+      Serial.println("Commands: b=blank  m=menu  u=up  d=down  r=select  p=polling mode");
+      Serial.println("          g=cycle gain  i=cycle itime  (last two: raw TCS34725 only)");
+    }
   }
 }
 
 void loop() {
   colorimeter.update();
+
+#if STARTUP_MODE == APP_POLLING
+  // ---- Polling mode: read any measurement via public getters ---------------
+  //
+  // All getters are available regardless of which sensors are fitted.
+  // A return value of -1.0 signals an error or out-of-range condition.
+  // getTCSRaw() / getBH1750Raw() additionally return a SensorResult code.
+
+  float absorbance    = colorimeter.getAbsorbance();
+  float transmittance = colorimeter.getTransmittance();
+
+  float tcs_raw    = -1.0f;
+  float bh1750_raw = -1.0f;
+  SensorResult tcs_result    = SENSOR_IO_ERROR;
+  SensorResult bh1750_result = SENSOR_IO_ERROR;
+
+  if (colorimeter.isTCSPresent())    tcs_result    = colorimeter.getTCSRaw(tcs_raw);
+  if (colorimeter.isBH1750Present()) bh1750_result = colorimeter.getBH1750Raw(bh1750_raw);
+
+  // Example output – replace with your own processing logic.
+  Serial.print("ABS:");   Serial.print(absorbance,    4);
+  Serial.print("  TRANS:"); Serial.print(transmittance, 4);
+  if (tcs_result    == SENSOR_OK) { Serial.print("  TCS:");  Serial.print(tcs_raw,    1); }
+  if (bh1750_result == SENSOR_OK) { Serial.print("  BH:");   Serial.print(bh1750_raw, 1); }
+  Serial.println();
+#endif
+
   delay(Colorimeter::LOOP_DT_MS);
 }
