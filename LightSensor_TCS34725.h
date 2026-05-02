@@ -1,16 +1,13 @@
 /*
  * LightSensor_TCS34725.h
- * Wrapper class for TCS34725 color sensor
+ * Wrapper class for the TCS34725 RGB+Clear light sensor.
  *
- * ESP32-S3 changes vs. original Arduino Uno port:
- *   - All four TCS34725 hardware gain steps are now exposed (1x/4x/16x/60x).
- *     The previous version silently mapped both GAIN_HIGH and GAIN_MAX to 60x,
- *     making one cycle step a no-op.
- *   - C++ exceptions replaced with a SensorResult return-code pattern.
- *     The ESP32 Arduino core disables exceptions by default; enabling them
- *     adds overhead and is non-idiomatic for embedded targets.
- *   - cycleGain() and cycleIntegrationTime() moved here from Colorimeter so
- *     the cycling logic lives alongside the enum definitions it depends on.
+ * Changes in this revision:
+ *   - SensorResult moved to SensorCommon.h so BH1750 driver can share it.
+ *   - getValue(float& out) overload added alongside getValue(uint16_t& out).
+ *     Colorimeter calls the float overload for both sensors so the same
+ *     arithmetic path (raw / blank → transmittance → absorbance) works
+ *     regardless of which sensor is active.
  */
 
 #ifndef LIGHT_SENSOR_TCS34725_H
@@ -18,26 +15,17 @@
 
 #include <Wire.h>
 #include "Adafruit_TCS34725.h"
-
-// ---------------------------------------------------------------------------
-// Result codes returned by getValue() in place of thrown exceptions
-// ---------------------------------------------------------------------------
-enum SensorResult : uint8_t {
-  SENSOR_OK       = 0,
-  SENSOR_OVERFLOW = 1,  // clear channel >= saturation limit
-  SENSOR_IO_ERROR = 2   // device not responding on I2C
-};
+#include "SensorCommon.h"
 
 // ---------------------------------------------------------------------------
 // Gain
 //
-// Ordinal values (0-3) deliberately match the TCS34725 register values
-// (TCS34725_GAIN_1X = 0x00 … TCS34725_GAIN_60X = 0x03) so a direct
-// static_cast to tcs34725Gain_t is always safe.
+// Ordinal values 0-3 match TCS34725 register values so static_cast to
+// tcs34725Gain_t is always safe.
 //
 // Accepted configuration.json strings: "1x" | "4x" | "16x" | "60x"
-// Legacy strings "low" / "med" / "high" / "max" remain accepted in
-// Configuration.h for backwards compatibility with existing JSON files.
+// Legacy strings "low" / "med" / "high" / "max" also accepted in
+// Configuration.h for backwards compatibility.
 // ---------------------------------------------------------------------------
 enum Gain_t : uint8_t {
   GAIN_1X  = TCS34725_GAIN_1X,    // 0x00 –  1x  (bright environments)
@@ -46,7 +34,6 @@ enum Gain_t : uint8_t {
   GAIN_60X = TCS34725_GAIN_60X    // 0x03 – 60x  (dark environments)
 };
 
-// Ordered sequence used by cycleGain()
 static const Gain_t GAIN_CYCLE_ORDER[] = {
   GAIN_1X, GAIN_4X, GAIN_16X, GAIN_60X
 };
@@ -55,16 +42,14 @@ static const uint8_t GAIN_CYCLE_LEN =
 
 // ---------------------------------------------------------------------------
 // Integration time
-//
-// Register values are non-contiguous, so cycling uses ITIME_CYCLE_ORDER.
 // ---------------------------------------------------------------------------
 enum IntegrationTime_t : uint8_t {
-  INTEGRATIONTIME_100MS = TCS34725_INTEGRATIONTIME_101MS,  // ~100 ms
-  INTEGRATIONTIME_200MS = TCS34725_INTEGRATIONTIME_199MS,  // ~200 ms
-  INTEGRATIONTIME_300MS = TCS34725_INTEGRATIONTIME_300MS,  // ~300 ms
-  INTEGRATIONTIME_400MS = TCS34725_INTEGRATIONTIME_401MS,  // ~400 ms
-  INTEGRATIONTIME_500MS = TCS34725_INTEGRATIONTIME_499MS,  // ~500 ms (default)
-  INTEGRATIONTIME_600MS = TCS34725_INTEGRATIONTIME_614MS   // ~614 ms
+  INTEGRATIONTIME_100MS = TCS34725_INTEGRATIONTIME_101MS,
+  INTEGRATIONTIME_200MS = TCS34725_INTEGRATIONTIME_199MS,
+  INTEGRATIONTIME_300MS = TCS34725_INTEGRATIONTIME_300MS,
+  INTEGRATIONTIME_400MS = TCS34725_INTEGRATIONTIME_401MS,
+  INTEGRATIONTIME_500MS = TCS34725_INTEGRATIONTIME_499MS,  // default
+  INTEGRATIONTIME_600MS = TCS34725_INTEGRATIONTIME_614MS
 };
 
 static const IntegrationTime_t ITIME_CYCLE_ORDER[] = {
@@ -79,11 +64,10 @@ static const uint8_t ITIME_CYCLE_LEN =
   sizeof(ITIME_CYCLE_ORDER) / sizeof(ITIME_CYCLE_ORDER[0]);
 
 // ---------------------------------------------------------------------------
-// LightSensor
+// LightSensor (TCS34725)
 // ---------------------------------------------------------------------------
 class LightSensor {
 public:
-  // Saturation counts differ at 100 ms vs. all longer integration times
   static const uint16_t MAX_COUNTS_100MS = 36863;  // 0x8FFF
   static const uint16_t MAX_COUNTS       = 65535;  // 0xFFFF
 
@@ -95,7 +79,6 @@ public:
 
   // ---- Lifecycle ----------------------------------------------------------
 
-  // Call once in setup().  Returns false if the device is not found on I2C.
   bool initialize() {
     if (!tcs.begin()) return false;
     _initialized = true;
@@ -115,7 +98,6 @@ public:
 
   Gain_t getGain() const { return _gain; }
 
-  // Advance to the next step in the 4-step cycle; wraps around.
   void cycleGain() {
     for (uint8_t i = 0; i < GAIN_CYCLE_LEN; i++) {
       if (GAIN_CYCLE_ORDER[i] == _gain) {
@@ -123,7 +105,7 @@ public:
         return;
       }
     }
-    setGain(GAIN_CYCLE_ORDER[0]);  // unknown value → reset
+    setGain(GAIN_CYCLE_ORDER[0]);
   }
 
   // ---- Integration time ---------------------------------------------------
@@ -135,7 +117,6 @@ public:
 
   IntegrationTime_t getIntegrationTime() const { return _integration_time; }
 
-  // Advance to the next integration time; wraps around.
   void cycleIntegrationTime() {
     for (uint8_t i = 0; i < ITIME_CYCLE_LEN; i++) {
       if (ITIME_CYCLE_ORDER[i] == _integration_time) {
@@ -146,37 +127,37 @@ public:
     setIntegrationTime(ITIME_CYCLE_ORDER[0]);
   }
 
-  // ---- Saturation ceiling for the current integration time ----------------
+  // ---- Saturation ceiling -------------------------------------------------
 
   uint16_t getMaxCounts() const {
     return (_integration_time == INTEGRATIONTIME_100MS)
-             ? MAX_COUNTS_100MS
-             : MAX_COUNTS;
+             ? MAX_COUNTS_100MS : MAX_COUNTS;
   }
 
   // ---- Primary measurement ------------------------------------------------
-  //
-  // Reads the clear (broadband) channel, which is used for absorbance and
-  // transmittance calculations.  Writes the result to `out`.
-  //
-  // Returns:
-  //   SENSOR_OK       – successful read, `out` is valid
-  //   SENSOR_OVERFLOW – sensor is saturated; reduce gain or integration time
-  //   SENSOR_IO_ERROR – device unreachable (check wiring / I2C address)
 
+  // Integer overload – returns raw 16-bit clear channel count.
   SensorResult getValue(uint16_t& out) {
     if (!_initialized) return SENSOR_IO_ERROR;
 
     uint16_t r, g, b, c;
     tcs.getRawData(&r, &g, &b, &c);
 
-    // All-zero with a live device is diagnostic of an I2C fault
     if (r == 0 && g == 0 && b == 0 && c == 0) return SENSOR_IO_ERROR;
-
-    if (c >= getMaxCounts()) return SENSOR_OVERFLOW;
+    if (c >= getMaxCounts())                   return SENSOR_OVERFLOW;
 
     out = c;
     return SENSOR_OK;
+  }
+
+  // Float overload – same value cast to float.
+  // Colorimeter uses this overload so the same arithmetic works for both
+  // the TCS34725 (counts) and BH1750 (lux) without separate code paths.
+  SensorResult getValue(float& out) {
+    uint16_t raw;
+    SensorResult r = getValue(raw);
+    if (r == SENSOR_OK) out = static_cast<float>(raw);
+    return r;
   }
 
   // ---- Auxiliary readings -------------------------------------------------

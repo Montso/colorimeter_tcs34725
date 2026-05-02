@@ -1,6 +1,13 @@
 {
-  "gain": "med",
+  "_comment": "primary_sensor drives Absorbance/Transmittance. Both sensors are always active if present.",
+  "primary_sensor": "tcs34725",
+
+  "gain": "16x",
   "integration_time": "500ms",
+
+  "bh1750_sensitivity": "default",
+  "bh1750_mode": "high_res",
+
   "precision": 2,
   "startup": "Absorbance"
 }

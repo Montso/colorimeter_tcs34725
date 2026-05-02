@@ -1,29 +1,32 @@
 /*
- * TCS34725_Colorimeter.h
- * Main colorimeter class – orchestrates sensor, calibrations, and measurements.
+ * Colorimeter.h
+ * Main colorimeter class.
  *
- * ESP32-S3 changes vs. original Arduino Uno port:
- *   - All try/catch blocks replaced with SensorResult return-code checks.
- *   - cycleGain() and cycleIntegrationTime() delegated to LightSensor so the
- *     4-step gain cycle (1x/4x/16x/60x) is driven by the enum defined there.
- *   - SD card references removed; LittleFS init is in the main sketch.
- *   - Serial baud rate comment updated to 115200.
- *   - blank_value stored as float32; no precision change needed on ESP32-S3
- *     (hardware FPU handles float efficiently).
+ * Changes in this revision:
+ *   - Both TCS34725 and BH1750 are always initialised if present on the bus.
+ *     _tcs_ok / _bh1750_ok flags track which sensors responded at startup.
+ *   - Generic "Raw Sensor" replaced by "Raw TCS34725" and "Raw BH1750" as
+ *     distinct menu items, added only if the corresponding sensor is present.
+ *   - Absorbance and Transmittance use the "primary_sensor" from config.
+ *     If that sensor failed to initialise, the other is used as fallback
+ *     rather than aborting entirely.
+ *   - 'g' / 'i' commands in raw mode act on the sensor matching the currently
+ *     selected raw measurement, not a global active-sensor variable.
+ *   - blankSensor() blanks the primary sensor (the one used for Abs/Trans).
  */
 
-#ifndef TCS34725_COLORIMETER_H
-#define TCS34725_COLORIMETER_H
+#ifndef COLORIMETER_H
+#define COLORIMETER_H
 
 #include <Arduino.h>
 #include <math.h>
+#include <vector>
+#include "SensorCommon.h"
 #include "LightSensor_TCS34725.h"
+#include "LightSensor_BH1750.h"
 #include "Calibrations.h"
 #include "Configuration.h"
 
-// ---------------------------------------------------------------------------
-// Operating modes
-// ---------------------------------------------------------------------------
 enum OperatingMode : uint8_t {
   MODE_MEASURE = 0,
   MODE_MENU    = 1,
@@ -31,21 +34,17 @@ enum OperatingMode : uint8_t {
   MODE_ABORT   = 3
 };
 
-// ---------------------------------------------------------------------------
-// Colorimeter
-// ---------------------------------------------------------------------------
 class Colorimeter {
 public:
-  // Blanking
-  static const uint8_t NUM_BLANK_SAMPLES = 50;
-  static const uint32_t BLANK_DT_MS      = 50;   // ms between blank samples
-  static const uint32_t LOOP_DT_MS       = 100;  // ms per main loop cycle
-  static const uint32_t DEBOUNCE_DT_MS   = 600;  // ms button debounce
+  static const uint8_t  NUM_BLANK_SAMPLES = 50;
+  static const uint32_t BLANK_DT_MS       = 50;
+  static const uint32_t LOOP_DT_MS        = 100;
+  static const uint32_t DEBOUNCE_DT_MS    = 600;
 
-  // Measurement name constants
   static const String ABSORBANCE_STR;
   static const String TRANSMITTANCE_STR;
-  static const String RAW_SENSOR_STR;
+  static const String RAW_TCS_STR;     // "Raw TCS34725"
+  static const String RAW_BH1750_STR;  // "Raw BH1750"
   static const String ABOUT_STR;
 
   Colorimeter()
@@ -55,90 +54,113 @@ public:
       _blank_value(1.0f),
       _last_button_ms(0),
       _menu_item_pos(0),
-      _menu_view_pos(0) {}
+      _menu_view_pos(0),
+      _primary_sensor(SENSOR_TYPE_TCS34725),
+      _tcs_ok(false),
+      _bh1750_ok(false),
+      _pending_is_abort(false) {}
 
   // ---- Lifecycle ----------------------------------------------------------
 
-  // Call once in setup() after LittleFS.begin().  Returns false only on a
-  // fatal sensor fault; all other errors set MODE_MESSAGE / MODE_ABORT and
-  // still return true so the message loop can display them.
   bool begin() {
-    // Initialise light sensor ------------------------------------------------
-    if (!_sensor.initialize()) {
-      Serial.println("ERROR: TCS34725 not found – check I2C wiring");
-      _postMessage("Sensor not found", true);
-      _mode = MODE_ABORT;
-      return false;
-    }
-
-    // Load configuration -----------------------------------------------------
+    // Load config first (determines primary sensor and initial settings)
     if (!_config.load()) {
       _postMessage("Config load failed", false);
       _mode = MODE_MESSAGE;
     }
+    _primary_sensor = _config.getPrimarySensor();
 
-    // Apply sensor settings from configuration
-    if (_config.isGainSet())            _sensor.setGain(_config.getGain());
-    if (_config.isIntegrationTimeSet()) _sensor.setIntegrationTime(_config.getIntegrationTime());
-
-    // Load calibrations ------------------------------------------------------
-    if (!_calibrations.load()) {
-      // File absent is non-fatal – device still works for Abs/Trans/Raw
-      Serial.println("WARNING: Calibrations not loaded");
+    // ---- Initialise TCS34725 -----------------------------------------------
+    _tcs_ok = _tcs.initialize();
+    if (_tcs_ok) {
+      if (_config.isGainSet())            _tcs.setGain(_config.getGain());
+      if (_config.isIntegrationTimeSet()) _tcs.setIntegrationTime(_config.getIntegrationTime());
+      Serial.println("TCS34725: OK");
+    } else {
+      Serial.println("TCS34725: not found");
     }
 
+    // ---- Initialise BH1750 -------------------------------------------------
+    _bh1750_ok = _bh1750.initialize();
+    if (_bh1750_ok) {
+      if (_config.isBH1750MTregSet()) _bh1750.setMTreg(_config.getBH1750MTreg());
+      if (_config.isBH1750ModeSet())  _bh1750.setMode(_config.getBH1750Mode());
+      Serial.println("BH1750:   OK");
+    } else {
+      Serial.println("BH1750:   not found");
+    }
+
+    // ---- Abort only if the primary sensor is missing -----------------------
+    // If the primary is absent but the other sensor is present, fall back
+    // gracefully rather than aborting.
+    if (!_tcs_ok && !_bh1750_ok) {
+      _postMessage("No sensors found", true);
+      _mode = MODE_ABORT;
+      return false;
+    }
+
+    if (_primary_sensor == SENSOR_TYPE_TCS34725 && !_tcs_ok) {
+      Serial.println("WARNING: primary sensor TCS34725 absent, falling back to BH1750");
+      _primary_sensor = SENSOR_TYPE_BH1750;
+    } else if (_primary_sensor == SENSOR_TYPE_BH1750 && !_bh1750_ok) {
+      Serial.println("WARNING: primary sensor BH1750 absent, falling back to TCS34725");
+      _primary_sensor = SENSOR_TYPE_TCS34725;
+    }
+
+    // ---- Calibrations ------------------------------------------------------
+    if (!_calibrations.load()) {
+      Serial.println("WARNING: Calibrations not loaded");
+    }
     if (_calibrations.hasErrors()) {
       _postMessage("Calibration errors found", false);
       _mode = MODE_MESSAGE;
     }
 
-    // Build menu -------------------------------------------------------------
+    // ---- Menu and startup measurement --------------------------------------
     _buildMenuItems();
 
-    // Set startup measurement ------------------------------------------------
     String startup = _config.getStartup();
     if (!startup.isEmpty() && _isValidMenuItem(startup)) {
       _measurement_name = startup;
     } else {
       if (!startup.isEmpty()) {
-        Serial.print("WARNING: startup measurement \"");
+        Serial.print("WARNING: startup \"");
         Serial.print(startup);
         Serial.println("\" not found – defaulting to Absorbance");
-        _postMessage("Startup not found", false);
-        _mode = MODE_MESSAGE;
       }
       _measurement_name = ABSORBANCE_STR;
     }
 
-    // Preliminary blank (set_blanked = false so the UI shows "not blanked") --
+    // Preliminary blank (set_blanked = false → UI shows "not blanked")
     blankSensor(false);
-
     return true;
   }
 
-  // Call repeatedly from loop()
   void update() {
     _handleSerial();
     _updateDisplay();
   }
 
-  // ---- Public measurement API ---------------------------------------------
+  // ---- Measurement API ----------------------------------------------------
 
-  // Read raw clear-channel value.
-  // Writes result to `out`.  Returns SENSOR_OK, SENSOR_OVERFLOW, or SENSOR_IO_ERROR.
-  SensorResult getRawValue(uint16_t& out) {
-    return _sensor.getValue(out);
+  // Read the primary sensor (used for Abs/Trans).
+  SensorResult getPrimaryRaw(float& out) {
+    return (_primary_sensor == SENSOR_TYPE_BH1750)
+             ? _bh1750.getValue(out)
+             : _tcs.getValue(out);
   }
 
-  // Returns transmittance [0,1], or -1 on sensor error / overflow.
+  // Read a specific sensor by name – used internally for the two raw items.
+  SensorResult getTCSRaw(float& out)    { return _tcs.getValue(out); }
+  SensorResult getBH1750Raw(float& out) { return _bh1750.getValue(out); }
+
   float getTransmittance() {
-    uint16_t raw;
-    if (_sensor.getValue(raw) != SENSOR_OK) return -1.0f;
-    if (_blank_value <= 0.0f) return -1.0f;
-    return static_cast<float>(raw) / _blank_value;
+    float raw;
+    if (getPrimaryRaw(raw) != SENSOR_OK) return -1.0f;
+    if (_blank_value <= 0.0f)            return -1.0f;
+    return raw / _blank_value;
   }
 
-  // Returns absorbance (optical density), clamped to >= 0.  Returns -1 on error.
   float getAbsorbance() {
     float t = getTransmittance();
     if (t <= 0.0f) return -1.0f;
@@ -146,69 +168,72 @@ public:
     return (a > 0.0f) ? a : 0.0f;
   }
 
-  // Returns the value appropriate for the current measurement selection.
-  // -1.0 signals "invalid / out of range / overflow" to the caller.
   float getMeasurementValue() {
     if (_measurement_name == ABSORBANCE_STR)    return getAbsorbance();
     if (_measurement_name == TRANSMITTANCE_STR) return getTransmittance();
-    if (_measurement_name == RAW_SENSOR_STR) {
-      uint16_t raw;
-      SensorResult r = _sensor.getValue(raw);
-      return (r == SENSOR_OK) ? static_cast<float>(raw) : -1.0f;
+    if (_measurement_name == RAW_TCS_STR) {
+      float v; return (getTCSRaw(v) == SENSOR_OK) ? v : -1.0f;
     }
-
-    // Custom calibration
+    if (_measurement_name == RAW_BH1750_STR) {
+      float v; return (getBH1750Raw(v) == SENSOR_OK) ? v : -1.0f;
+    }
+    // Custom calibration (uses primary sensor for absorbance)
     float a = getAbsorbance();
-    if (a < 0.0f) return -1.0f;
-    return _calibrations.apply(_measurement_name, a);
+    return (a >= 0.0f) ? _calibrations.apply(_measurement_name, a) : -1.0f;
   }
 
   String getMeasurementUnits() {
-    if (_measurement_name == ABSORBANCE_STR ||
+    if (_measurement_name == ABSORBANCE_STR    ||
         _measurement_name == TRANSMITTANCE_STR ||
-        _measurement_name == RAW_SENSOR_STR) {
-      return "";
-    }
+        _measurement_name == RAW_TCS_STR       ||
+        _measurement_name == RAW_BH1750_STR)   return "";
     return _calibrations.getUnits(_measurement_name);
   }
 
   // ---- Blanking -----------------------------------------------------------
 
-  // Collect NUM_BLANK_SAMPLES readings, compute the median, store as reference.
-  // set_blanked = false performs the reading without marking the device as
-  // blanked (used at startup).
+  // Blanks the primary sensor only. The raw sensor items are not affected;
+  // they display absolute values and don't use the blank reference.
   void blankSensor(bool set_blanked = true) {
     float samples[NUM_BLANK_SAMPLES];
 
     for (uint8_t i = 0; i < NUM_BLANK_SAMPLES; i++) {
-      uint16_t raw;
-      SensorResult r = _sensor.getValue(raw);
-      // On overflow use max counts so the median calculation is still valid
-      samples[i] = (r == SENSOR_OVERFLOW)
-                     ? static_cast<float>(_sensor.getMaxCounts())
-                     : static_cast<float>(raw);
+      float raw;
+      SensorResult r = getPrimaryRaw(raw);
+      if (r == SENSOR_OVERFLOW) {
+        raw = (_primary_sensor == SENSOR_TYPE_BH1750)
+                ? LightSensorBH1750::MAX_LUX
+                : static_cast<float>(_tcs.getMaxCounts());
+      } else if (r == SENSOR_IO_ERROR) {
+        raw = 0.0f;
+      }
+      samples[i] = raw;
       delay(BLANK_DT_MS);
     }
 
     _blank_value = _median(samples, NUM_BLANK_SAMPLES);
     _is_blanked  = set_blanked;
 
-    Serial.print("Blank value: ");
+    Serial.print("Blank value (");
+    Serial.print(_primary_sensor == SENSOR_TYPE_BH1750 ? "BH1750 lux" : "TCS34725 counts");
+    Serial.print("): ");
     Serial.println(_blank_value);
   }
 
   // ---- State accessors ----------------------------------------------------
 
-  OperatingMode  getMode()            const { return _mode; }
-  String         getMeasurementName() const { return _measurement_name; }
-  bool           getIsBlanked()       const { return _is_blanked; }
-  Gain_t         getSensorGain()      const { return _sensor.getGain(); }
-  IntegrationTime_t getSensorItime()  const { return _sensor.getIntegrationTime(); }
+  OperatingMode getMode()            const { return _mode; }
+  String        getMeasurementName() const { return _measurement_name; }
+  bool          getIsBlanked()       const { return _is_blanked; }
+  bool          isTCSPresent()       const { return _tcs_ok; }
+  bool          isBH1750Present()    const { return _bh1750_ok; }
+  SensorType    getPrimarySensor()   const { return _primary_sensor; }
 
 private:
-  LightSensor   _sensor;
-  Configuration _config;
-  Calibrations  _calibrations;
+  LightSensor       _tcs;
+  LightSensorBH1750 _bh1750;
+  Configuration     _config;
+  Calibrations      _calibrations;
 
   OperatingMode _mode;
   String        _measurement_name;
@@ -221,9 +246,12 @@ private:
   uint8_t             _menu_view_pos;
   static const uint8_t ITEMS_PER_SCREEN = 5;
 
-  // Pending message for MODE_MESSAGE display
+  SensorType _primary_sensor;
+  bool       _tcs_ok;
+  bool       _bh1750_ok;
+
   String _pending_message;
-  bool   _pending_is_abort = false;
+  bool   _pending_is_abort;
 
   // ---- Menu ---------------------------------------------------------------
 
@@ -231,7 +259,9 @@ private:
     _menu_items.clear();
     _menu_items.push_back(ABSORBANCE_STR);
     _menu_items.push_back(TRANSMITTANCE_STR);
-    _menu_items.push_back(RAW_SENSOR_STR);
+    // Add raw items only for sensors that actually responded
+    if (_tcs_ok)    _menu_items.push_back(RAW_TCS_STR);
+    if (_bh1750_ok) _menu_items.push_back(RAW_BH1750_STR);
     for (const auto& kv : _calibrations.getAllCalibrations()) {
       _menu_items.push_back(kv.first);
     }
@@ -245,7 +275,13 @@ private:
     return false;
   }
 
-  // ---- Button / serial input ----------------------------------------------
+  // Returns true if the current measurement is either raw sensor view.
+  bool _isRawView() const {
+    return _measurement_name == RAW_TCS_STR ||
+           _measurement_name == RAW_BH1750_STR;
+  }
+
+  // ---- Serial input -------------------------------------------------------
 
   void _handleSerial() {
     if (!Serial.available()) return;
@@ -258,18 +294,23 @@ private:
     switch (_mode) {
 
       case MODE_MEASURE:
-        if (cmd == 'b' && _measurement_name != RAW_SENSOR_STR) {
+        if (cmd == 'b' && !_isRawView()) {
           blankSensor();
+
         } else if (cmd == 'm') {
           _mode = MODE_MENU;
           _menu_item_pos = 0;
           _menu_view_pos = 0;
-        } else if (cmd == 'g' && _measurement_name == RAW_SENSOR_STR) {
-          _sensor.cycleGain();
-          _is_blanked = false;
-        } else if (cmd == 'i' && _measurement_name == RAW_SENSOR_STR) {
-          _sensor.cycleIntegrationTime();
-          _is_blanked = false;
+
+        } else if (cmd == 'g' && _isRawView()) {
+          // Cycle sensitivity on the sensor currently being viewed
+          if (_measurement_name == RAW_TCS_STR)    _tcs.cycleGain();
+          if (_measurement_name == RAW_BH1750_STR) _bh1750.cycleMTreg();
+
+        } else if (cmd == 'i' && _isRawView()) {
+          // Cycle integration/mode on the sensor currently being viewed
+          if (_measurement_name == RAW_TCS_STR)    _tcs.cycleIntegrationTime();
+          if (_measurement_name == RAW_BH1750_STR) _bh1750.cycleMode();
         }
         break;
 
@@ -284,14 +325,17 @@ private:
         } else if (cmd == 'd') {
           if (_menu_item_pos < (uint8_t)(_menu_items.size() - 1)) {
             _menu_item_pos++;
-            if (_menu_item_pos >= _menu_view_pos + ITEMS_PER_SCREEN) {
+            if (_menu_item_pos >= _menu_view_pos + ITEMS_PER_SCREEN)
               _menu_view_pos++;
-            }
           }
         } else if (cmd == 'r') {
           const String& sel = _menu_items[_menu_item_pos];
           if (sel == ABOUT_STR) {
-            _postMessage("Firmware v1.0 / ESP32-S3", false);
+            String about = "Firmware v1.0 | primary: ";
+            about += (_primary_sensor == SENSOR_TYPE_BH1750) ? "BH1750" : "TCS34725";
+            about += _tcs_ok    ? " | TCS:OK"  : " | TCS:--";
+            about += _bh1750_ok ? " | BH:OK"   : " | BH:--";
+            _postMessage(about, false);
             _mode = MODE_MESSAGE;
           } else {
             _measurement_name = sel;
@@ -301,7 +345,6 @@ private:
         break;
 
       case MODE_MESSAGE:
-        // Pop the next queued calibration error, or return to measure
         if (_calibrations.hasErrors()) {
           _postMessage(_calibrations.popError(), false);
         } else {
@@ -310,12 +353,11 @@ private:
         break;
 
       case MODE_ABORT:
-        // No recovery without hardware reset
         break;
     }
   }
 
-  // ---- Display (Serial) ---------------------------------------------------
+  // ---- Display ------------------------------------------------------------
 
   void _updateDisplay() {
     switch (_mode) {
@@ -334,24 +376,39 @@ private:
     Serial.print(": ");
 
     if (value < 0.0f) {
-      // Distinguish overflow from out-of-range
-      uint16_t probe;
-      SensorResult r = _sensor.getValue(probe);
+      // Distinguish overflow from out-of-range for the relevant sensor
+      float probe;
+      SensorResult r;
+      if      (_measurement_name == RAW_TCS_STR)    r = getTCSRaw(probe);
+      else if (_measurement_name == RAW_BH1750_STR) r = getBH1750Raw(probe);
+      else                                           r = getPrimaryRaw(probe);
       Serial.print(r == SENSOR_OVERFLOW ? "OVERFLOW" : "OUT OF RANGE");
     } else {
       Serial.print(value, _config.getPrecision());
       if (units.length()) { Serial.print(" "); Serial.print(units); }
     }
 
-    if (_measurement_name == RAW_SENSOR_STR) {
-      Serial.print("  [gain: ");
-      Serial.print(LightSensor::gainToString(_sensor.getGain()));
-      Serial.print("  itime: ");
-      Serial.print(LightSensor::integrationTimeToString(_sensor.getIntegrationTime()));
+    // Sensor-specific status suffix
+    if (_measurement_name == RAW_TCS_STR) {
+      Serial.print("  [gain:");
+      Serial.print(LightSensor::gainToString(_tcs.getGain()));
+      Serial.print(" itime:");
+      Serial.print(LightSensor::integrationTimeToString(_tcs.getIntegrationTime()));
+      Serial.print("]");
+    } else if (_measurement_name == RAW_BH1750_STR) {
+      Serial.print("  [sens:");
+      Serial.print(LightSensorBH1750::mtregToString(_bh1750.getMTreg()));
+      Serial.print(" mode:");
+      Serial.print(LightSensorBH1750::modeToString(_bh1750.getMode()));
       Serial.print("]");
     } else {
-      Serial.print(_is_blanked ? "  [blanked]" : "  [not blanked]");
+      // Abs / Trans / calibrated – show blanking status and primary sensor
+      Serial.print(_is_blanked ? "  [blanked" : "  [not blanked");
+      Serial.print("|primary:");
+      Serial.print(_primary_sensor == SENSOR_TYPE_BH1750 ? "BH1750" : "TCS34725");
+      Serial.print("]");
     }
+
     Serial.println();
   }
 
@@ -382,17 +439,12 @@ private:
     _pending_is_abort = is_abort;
   }
 
-  // ---- Utilities ----------------------------------------------------------
-
-  // Simple insertion-sort median – adequate for 50 samples on ESP32-S3.
+  // Insertion-sort median
   static float _median(float* arr, uint8_t n) {
     for (uint8_t i = 1; i < n; i++) {
       float key = arr[i];
       int8_t j  = static_cast<int8_t>(i) - 1;
-      while (j >= 0 && arr[j] > key) {
-        arr[j + 1] = arr[j];
-        j--;
-      }
+      while (j >= 0 && arr[j] > key) { arr[j + 1] = arr[j]; j--; }
       arr[j + 1] = key;
     }
     return (n % 2 == 0)
@@ -401,10 +453,10 @@ private:
   }
 };
 
-// Static member definitions
 const String Colorimeter::ABSORBANCE_STR    = "Absorbance";
 const String Colorimeter::TRANSMITTANCE_STR = "Transmittance";
-const String Colorimeter::RAW_SENSOR_STR    = "Raw Sensor";
+const String Colorimeter::RAW_TCS_STR       = "Raw TCS34725";
+const String Colorimeter::RAW_BH1750_STR    = "Raw BH1750";
 const String Colorimeter::ABOUT_STR         = "About";
 
-#endif // TCS34725_COLORIMETER_H
+#endif // COLORIMETER_H

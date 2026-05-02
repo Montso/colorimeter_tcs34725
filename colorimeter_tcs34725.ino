@@ -51,7 +51,6 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <LittleFS.h>
-
 #include "TCS34725_Colorimeter.h"
 
 Colorimeter colorimeter;
