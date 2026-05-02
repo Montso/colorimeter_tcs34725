@@ -25,10 +25,25 @@
 // ============================================================
 //  APPLICATION MODE  (applies to both mock and real builds)
 // ============================================================
-//  APP_MENU_DRIVEN – full interactive serial menu
-//  APP_POLLING     – no menu; your code reads values via getters
+//  APP_MENU_DRIVEN – full interactive serial menu; sensors read
+//                    and streamed every loop cycle.
+//
+//  APP_POLLING     – no menu or automatic display.  update()
+//                    manages stream / one-shot Serial commands
+//                    (s=stream  Enter=one-shot  x=stop).
+//                    Application code gates reads via
+//                    isPollingActive() / consumeOneShot().
+//
+//  APP_INTERRUPT   – fully idle.  update() does nothing except
+//                    service blank ('b') and mode-switch ('m','p')
+//                    Serial commands.  No sensor reads occur inside
+//                    update() at all.  Application code calls
+//                    getters on its own schedule (hardware trigger,
+//                    timer, RTOS task, test harness, etc.).
 // ============================================================
-#define STARTUP_MODE APP_POLLING
+#define STARTUP_MODE APP_INTERRUPT
+// #define STARTUP_MODE APP_POLLING
+// #define STARTUP_MODE APP_MENU_DRIVEN
 
 // ============================================================
 //  INCLUDES – conditional on mock vs. real
@@ -91,35 +106,55 @@ void setup() {
   Serial.print("BH1750   present: "); Serial.println(colorimeter.isBH1750Present() ? "yes" : "no");
 #endif
 
-  if (STARTUP_MODE == APP_POLLING) {
-    Serial.println("Mode: POLLING – reading values in loop()");
-    Serial.println("Send 'b' to blank, 'm' to toggle display mode");
+  if (STARTUP_MODE == APP_INTERRUPT) {
+    Serial.println("Mode: INTERRUPT – call getters on demand; update() stays idle");
+    Serial.println("Commands: b=blank  m=menu  p=polling  ?=help");
+  } else if (STARTUP_MODE == APP_POLLING) {
+    Serial.println("Mode: POLLING (idle) – no output until commanded");
+    Serial.println("  s=stream  Enter=one-shot  x=stop  b=blank  m=menu  ?=help");
   } else {
     Serial.println("Mode: MENU-DRIVEN");
-    Serial.println("Commands: b=blank  m=menu  u=up  d=down  r=select");
+    Serial.println("Commands: b=blank  m=menu  u=up  d=down  r=select  p=polling");
   }
 }
 
 // ===========================================================================
 //  loop()
 //
-//  update() must always be called first – it handles Serial input and
-//  (in menu mode) prints the current measurement.  The application code
-//  below is only reached in POLLING mode.
+//  update() must always be called first – it services Serial input and
+//  (in menu-driven mode) prints the current measurement.
+//
+//  ┌─────────────────┬──────────────────────────────────────────────────────┐
+//  │ APP_MENU_DRIVEN │ update() reads sensors + prints every cycle.         │
+//  │                 │ Nothing extra needed below.                          │
+//  ├─────────────────┼──────────────────────────────────────────────────────┤
+//  │ APP_POLLING     │ update() handles 's' / Enter / 'x' Serial commands.  │
+//  │                 │ Sensor-read block is gated by isPollingActive() or   │
+//  │                 │ consumeOneShot(); both return false when idle.        │
+//  ├─────────────────┼──────────────────────────────────────────────────────┤
+//  │ APP_INTERRUPT   │ update() is a near-no-op – only blank / mode-switch  │
+//  │                 │ Serial commands are checked; sensors are NEVER read.  │
+//  │                 │ Application code calls getters unconditionally on     │
+//  │                 │ every loop tick (or from a timer / ISR / task).       │
+//  └─────────────────┴──────────────────────────────────────────────────────┘
 // ===========================================================================
 void loop() {
-  colorimeter.update();
+  colorimeter.update();   // always call; does only what the current mode requires
 
-  // ---- POLLING MODE: application code goes here --------------------------
-  // This block is the part you are testing.  It calls only public getters
-  // and therefore compiles identically against MockColorimeter or Colorimeter.
-  if (colorimeter.getAppState() == APP_POLLING) {
+  // =========================================================================
+  //  INTERRUPT MODE  –  getters called on every loop tick.
+  //  update() guarantees it will never trigger a sensor read between calls,
+  //  so the application is the sole initiator of every I2C transaction.
+  //  Replace the body below with your own trigger logic (timer flag, ISR
+  //  semaphore, pin state, RTOS notify, etc.).
+  // =========================================================================
+  if (colorimeter.getAppState() == APP_INTERRUPT) {
 
-    // -- Absorbance & transmittance (primary sensor) -----------------------
+    // These calls are the ONLY things that touch the sensor hardware.
+    // Each getter performs exactly one I2C read (or zero, on error).
     float absorbance    = colorimeter.getAbsorbance();
     float transmittance = colorimeter.getTransmittance();
 
-    // -- Per-sensor raw readings -------------------------------------------
     float        tcs_raw    = -1.0f;
     float        bh1750_raw = -1.0f;
     SensorResult tcs_r      = SENSOR_IO_ERROR;
@@ -128,17 +163,16 @@ void loop() {
     if (colorimeter.isTCSPresent())    tcs_r    = colorimeter.getTCSRaw(tcs_raw);
     if (colorimeter.isBH1750Present()) bh1750_r = colorimeter.getBH1750Raw(bh1750_raw);
 
-    // -- Print results to Serial -------------------------------------------
-    // Replace this block with your own processing / display / logging logic.
-    Serial.print("ABS:");
-    if (absorbance < 0.0f) Serial.print("ERR ");
-    else                   { Serial.print(absorbance, 4); Serial.print(" "); }
+    // -- Replace this print block with your own processing logic. ----------
+    Serial.print("INT  ABS:");
+    if (absorbance < 0.0f) Serial.print("ERR  ");
+    else { Serial.print(absorbance, 4); Serial.print("  "); }
 
-    Serial.print("  TRANS:");
-    if (transmittance < 0.0f) Serial.print("ERR ");
-    else                      { Serial.print(transmittance, 4); Serial.print(" "); }
+    Serial.print("TRANS:");
+    if (transmittance < 0.0f) Serial.print("ERR  ");
+    else { Serial.print(transmittance, 4); Serial.print("  "); }
 
-    Serial.print("  TCS:");
+    Serial.print("TCS:");
     switch (tcs_r) {
       case SENSOR_OK:       Serial.print(tcs_raw, 1);    break;
       case SENSOR_OVERFLOW: Serial.print("OVF");         break;
@@ -154,12 +188,54 @@ void loop() {
 
     Serial.print("  BLANK:");
     Serial.print(colorimeter.getIsBlanked() ? "Y" : "N");
-
     Serial.println();
   }
-  #ifdef USE_MOCK_COLORIMETER
-  delay(MockColorimeter::LOOP_DT_MS);
-  #else
+
+  // =========================================================================
+  //  POLLING MODE  –  gated by Serial commands from update().
+  //  Sensors are read only when isPollingActive() or consumeOneShot() is true.
+  //  In idle state both return false; the block is skipped at zero sensor cost.
+  // =========================================================================
+  if (colorimeter.getAppState() == APP_POLLING &&
+      (colorimeter.isPollingActive() || colorimeter.consumeOneShot())) {
+
+    float absorbance    = colorimeter.getAbsorbance();
+    float transmittance = colorimeter.getTransmittance();
+
+    float        tcs_raw    = -1.0f;
+    float        bh1750_raw = -1.0f;
+    SensorResult tcs_r      = SENSOR_IO_ERROR;
+    SensorResult bh1750_r   = SENSOR_IO_ERROR;
+
+    if (colorimeter.isTCSPresent())    tcs_r    = colorimeter.getTCSRaw(tcs_raw);
+    if (colorimeter.isBH1750Present()) bh1750_r = colorimeter.getBH1750Raw(bh1750_raw);
+
+    Serial.print("POLL ABS:");
+    if (absorbance < 0.0f) Serial.print("ERR  ");
+    else { Serial.print(absorbance, 4); Serial.print("  "); }
+
+    Serial.print("TRANS:");
+    if (transmittance < 0.0f) Serial.print("ERR  ");
+    else { Serial.print(transmittance, 4); Serial.print("  "); }
+
+    Serial.print("TCS:");
+    switch (tcs_r) {
+      case SENSOR_OK:       Serial.print(tcs_raw, 1);    break;
+      case SENSOR_OVERFLOW: Serial.print("OVF");         break;
+      default:              Serial.print("ERR");         break;
+    }
+
+    Serial.print("  BH:");
+    switch (bh1750_r) {
+      case SENSOR_OK:       Serial.print(bh1750_raw, 1); break;
+      case SENSOR_OVERFLOW: Serial.print("OVF");         break;
+      default:              Serial.print("ERR");         break;
+    }
+
+    Serial.print("  BLANK:");
+    Serial.print(colorimeter.getIsBlanked() ? "Y" : "N");
+    Serial.println();
+  }
+
   delay(Colorimeter::LOOP_DT_MS);
-  #endif
 }

@@ -76,9 +76,16 @@ enum OperatingMode : uint8_t {
 
 enum AppState : uint8_t {
   APP_MENU_DRIVEN = 0,
-  APP_POLLING     = 1
+  APP_POLLING     = 1,
+  APP_INTERRUPT   = 2   // fully idle; application code calls getters on its own schedule
 };
 
+enum PollingState : uint8_t {
+  POLLING_IDLE    = 0,
+  POLLING_STREAM  = 1,
+  POLLING_ONESHOT = 2
+};
+ 
 enum SensorType : uint8_t {
   SENSOR_TYPE_TCS34725 = 0,
   SENSOR_TYPE_BH1750   = 1
@@ -164,6 +171,7 @@ public:
   MockColorimeter()
     : _scenario(MockScenario::STATIC_NORMAL),
       _app_state(APP_POLLING),
+      _polling_state(POLLING_IDLE),
       _mode(MODE_MEASURE),
       _measurement_name(ABSORBANCE_STR),
       _is_blanked(false),
@@ -187,17 +195,22 @@ public:
     }
 
     _print_scenario_help();
+    if (_app_state == APP_POLLING) _print_polling_help();
     return true;
   }
 
   // update() handles Serial scenario-switching and (in menu mode) prints
   // the current measurement – matching the real Colorimeter's behaviour.
+  // In APP_INTERRUPT mode it is a near-no-op: only the Serial command handler
+  // runs (for blank and mode-switch), and nothing is printed or read.
   void update() {
-    _handle_serial();
+    _handle_serial();   // always check for scenario / mode commands
 
+    // Display only in menu-driven mode
     if (_app_state == APP_MENU_DRIVEN && _mode == MODE_MEASURE) {
       _display_measure();
     }
+    // APP_POLLING and APP_INTERRUPT produce no output from update() itself
   }
 
   // ---- Scenario control ---------------------------------------------------
@@ -217,8 +230,31 @@ public:
 
   // ---- AppState -----------------------------------------------------------
 
-  void     setAppState(AppState s) { _app_state = s; }
-  AppState getAppState()     const { return _app_state; }
+  void setAppState(AppState s) {
+    _app_state = s;
+    if (s == APP_POLLING) {
+      _polling_state = POLLING_IDLE;
+      _print_polling_help();
+    } else if (s == APP_INTERRUPT) {
+      Serial.println("[MOCK] INT: idle – call getters directly; update() produces no output");
+      Serial.println("[MOCK] INT: commands: b=blank  m=menu  ?=help  0-9/o=scenario");
+    }
+  }
+  AppState getAppState() const { return _app_state; }
+
+  // True while POLLING_STREAM – application code should read and print.
+  bool isPollingActive() const {
+    return _app_state == APP_POLLING && _polling_state == POLLING_STREAM;
+  }
+
+  // Returns true exactly once per one-shot request, then resets to IDLE.
+  bool consumeOneShot() {
+    if (_app_state == APP_POLLING && _polling_state == POLLING_ONESHOT) {
+      _polling_state = POLLING_IDLE;
+      return true;
+    }
+    return false;
+  }
 
   // ---- Core measurements --------------------------------------------------
 
@@ -306,8 +342,9 @@ public:
   SensorType    getPrimarySensor()   const { return _seed().primary; }
 
 private:
-  MockScenario _scenario;
-  AppState     _app_state;
+  MockScenario  _scenario;
+  AppState      _app_state;
+  PollingState  _polling_state;
   OperatingMode _mode;
   String       _measurement_name;
   bool         _is_blanked;
@@ -367,10 +404,38 @@ private:
 
     char cmd = Serial.read();
     uint32_t now = millis();
-    if ((now - _last_cmd_ms) < 200) return; // light debounce for mock
+    if ((now - _last_cmd_ms) < 200) return;
     _last_cmd_ms = now;
 
-    // Scenario selection by digit
+    // ---- Polling-mode commands (highest priority) -------------------------
+    if (_app_state == APP_POLLING) {
+      if (cmd == 's') {
+        _polling_state = POLLING_STREAM;
+        Serial.println("[MOCK] POLL: streaming ON  ('x' to stop, Enter for one-shot)");
+        return;
+      }
+      if (cmd == 'x' || cmd == 'q') {
+        _polling_state = POLLING_IDLE;
+        Serial.println("[MOCK] POLL: idle  ('s' to stream, Enter for one-shot)");
+        return;
+      }
+      if (cmd == '\n' || cmd == '\r') {
+        _polling_state = POLLING_ONESHOT;
+        return;
+      }
+      if (cmd == 'm') {
+        _app_state     = APP_MENU_DRIVEN;
+        _polling_state = POLLING_IDLE;
+        Serial.println("[MOCK] Switched to menu-driven mode");
+        return;
+      }
+      if (cmd == '?') {
+        _print_polling_help();
+        return;
+      }
+    }
+
+    // ---- Scenario selection (available in both modes) ---------------------
     if (cmd >= '0' && cmd <= '9') {
       uint8_t idx = cmd - '0';
       if (idx < (uint8_t)MockScenario::_COUNT) {
@@ -378,29 +443,23 @@ private:
       }
       return;
     }
-
-    // 'o' for OUT_OF_RANGE (index 10, can't be a digit key)
     if (cmd == 'o') {
       setScenario(MockScenario::OUT_OF_RANGE);
       return;
     }
 
-    if (cmd == 'b') {
-      blankSensor();
-      return;
-    }
+    // ---- Shared commands -------------------------------------------------
+    if (cmd == 'b') { blankSensor(); return; }
 
     if (cmd == '?') {
-      Serial.print("[MOCK] Current scenario: "); Serial.println(_seed().label);
-      Serial.print("[MOCK] Absorbance: ");        Serial.println(_compute_absorbance(), 4);
+      Serial.print("[MOCK] Scenario:   "); Serial.println(_seed().label);
+      Serial.print("[MOCK] Absorbance: "); Serial.println(_compute_absorbance(), 4);
       return;
     }
 
-    // 'm' switches between menu and polling display in mock too
-    if (cmd == 'm') {
-      _app_state = (_app_state == APP_POLLING) ? APP_MENU_DRIVEN : APP_POLLING;
-      Serial.print("[MOCK] App state → ");
-      Serial.println(_app_state == APP_POLLING ? "POLLING" : "MENU_DRIVEN");
+    // Toggle menu/polling when in menu-driven mode
+    if (cmd == 'p' && _app_state == APP_MENU_DRIVEN) {
+      setAppState(APP_POLLING);
     }
   }
 
@@ -423,6 +482,17 @@ private:
     Serial.print(_seed().label);
     Serial.print("]");
     Serial.println();
+  }
+
+  void _print_polling_help() {
+    Serial.println("[MOCK] POLL commands: s=stream  x=stop  Enter=one-shot  b=blank  m=menu  ?=help");
+    Serial.print  ("[MOCK] POLL state   : ");
+    switch (_polling_state) {
+      case POLLING_IDLE:    Serial.println("IDLE");    break;
+      case POLLING_STREAM:  Serial.println("STREAM");  break;
+      case POLLING_ONESHOT: Serial.println("ONESHOT"); break;
+    }
+    Serial.println("[MOCK] Scenario commands: 0-9 select, o=OUT_OF_RANGE, ?=scenario info");
   }
 
   void _print_scenario_help() {

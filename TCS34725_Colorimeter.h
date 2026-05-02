@@ -2,17 +2,16 @@
  * Colorimeter.h
  * Main colorimeter class.
  *
- * Changes in this revision:
- *   - Both TCS34725 and BH1750 are always initialised if present on the bus.
- *     _tcs_ok / _bh1750_ok flags track which sensors responded at startup.
- *   - Generic "Raw Sensor" replaced by "Raw TCS34725" and "Raw BH1750" as
- *     distinct menu items, added only if the corresponding sensor is present.
- *   - Absorbance and Transmittance use the "primary_sensor" from config.
- *     If that sensor failed to initialise, the other is used as fallback
- *     rather than aborting entirely.
- *   - 'g' / 'i' commands in raw mode act on the sensor matching the currently
- *     selected raw measurement, not a global active-sensor variable.
- *   - blankSensor() blanks the primary sensor (the one used for Abs/Trans).
+ * Operating modes (AppState):
+ *   APP_MENU_DRIVEN – full interactive serial menu; sensors read every cycle.
+ *   APP_POLLING     – no automatic display; application code gates reads via
+ *                     isPollingActive() / consumeOneShot().  PollingState
+ *                     sub-state (IDLE / STREAM / ONESHOT) is driven by
+ *                     Serial commands (s / Enter / x).
+ *   APP_INTERRUPT   – fully idle.  update() only services blank + mode-switch
+ *                     Serial commands.  No sensor reads occur in update().
+ *                     Application code calls getters on its own schedule
+ *                     (timer ISR, hardware trigger, test harness, etc.).
  */
 
 #ifndef COLORIMETER_H
@@ -34,13 +33,36 @@ enum OperatingMode : uint8_t {
   MODE_ABORT   = 3
 };
 
-// Top-level application state.
-//   APP_MENU_DRIVEN – full interactive serial menu (default).
-//   APP_POLLING     – no menu output; caller reads values via public getters.
-//                     Only 'b' (blank) and 'm' (return to menu) are handled.
+// AppState controls what update() does each loop cycle.
+//
+//   APP_MENU_DRIVEN  – full interactive serial menu; sensors read and printed
+//                      every cycle inside update().
+//
+//   APP_POLLING      – no automatic display.  update() processes streaming /
+//                      one-shot commands (s / Enter / x); application code
+//                      gates reads via isPollingActive() / consumeOneShot().
+//                      PollingState sub-state (IDLE / STREAM / ONESHOT) tracks
+//                      whether a read should happen on this cycle.
+//
+//   APP_INTERRUPT    – fully idle.  update() does nothing except service a
+//                      minimal set of Serial commands (blank, mode switch).
+//                      No sensor reads occur anywhere in update().
+//                      Application code calls getters directly and entirely
+//                      on its own schedule – the Colorimeter never initiates
+//                      a read or produces Serial output between those calls.
+//                      This is the right choice when an external trigger
+//                      (timer ISR, hardware pin, RTOS task, test harness)
+//                      controls measurement timing rather than loop().
 enum AppState : uint8_t {
-  APP_MENU_DRIVEN = 0,
-  APP_POLLING     = 1
+  APP_MENU_DRIVEN  = 0,  // full interactive serial menu
+  APP_POLLING      = 1,  // application code gates reads via isPollingActive() / consumeOneShot()
+  APP_INTERRUPT    = 2   // fully idle; application code calls getters on its own schedule
+};
+
+enum PollingState : uint8_t {
+  POLLING_IDLE    = 0,
+  POLLING_STREAM  = 1,
+  POLLING_ONESHOT = 2
 };
 
 class Colorimeter {
@@ -59,6 +81,7 @@ public:
   Colorimeter()
     : _mode(MODE_MEASURE),
       _app_state(APP_MENU_DRIVEN),
+      _polling_state(POLLING_IDLE),
       _measurement_name(ABSORBANCE_STR),
       _is_blanked(false),
       _blank_value(1.0f),
@@ -147,18 +170,54 @@ public:
   }
 
   void update() {
-    if (_app_state == APP_POLLING) {
-      _handlePollingSerial();
-    } else {
-      _handleSerial();
-      _updateDisplay();
+    switch (_app_state) {
+      case APP_INTERRUPT:
+        _handleInterruptSerial();   // sensors never touched here
+        break;
+      case APP_POLLING:
+        _handlePollingSerial();     // gates reads via isPollingActive() / consumeOneShot()
+        break;
+      default:                      // APP_MENU_DRIVEN
+        _handleSerial();
+        _updateDisplay();
+        break;
     }
   }
 
-  // ---- App-state control --------------------------------------------------
+  // ---- AppState / polling control -----------------------------------------
 
-  void     setAppState(AppState s) { _app_state = s; }
-  AppState getAppState()     const { return _app_state; }
+  void setAppState(AppState s) {
+    _app_state = s;
+    switch (s) {
+      case APP_POLLING:
+        _polling_state = POLLING_IDLE;
+        _printPollingHelp();
+        break;
+      case APP_INTERRUPT:
+        Serial.println("INT: idle – call getters directly to read sensors");
+        Serial.println("INT: commands: b=blank  m=menu  p=polling  ?=help");
+        break;
+      default:
+        break;
+    }
+  }
+  AppState getAppState() const { return _app_state; }
+
+  // True while POLLING_STREAM – application code should read and print.
+  bool isPollingActive() const {
+    return _app_state == APP_POLLING && _polling_state == POLLING_STREAM;
+  }
+
+  // Returns true exactly once per one-shot request, then resets to IDLE.
+  // Call at the top of the polling block in loop():
+  //   if (colorimeter.isPollingActive() || colorimeter.consumeOneShot()) { … }
+  bool consumeOneShot() {
+    if (_app_state == APP_POLLING && _polling_state == POLLING_ONESHOT) {
+      _polling_state = POLLING_IDLE;
+      return true;
+    }
+    return false;
+  }
 
   // ---- Measurement API ----------------------------------------------------
 
@@ -256,6 +315,7 @@ private:
 
   OperatingMode _mode;
   AppState      _app_state;
+  PollingState  _polling_state;
   String        _measurement_name;
   bool          _is_blanked;
   float         _blank_value;
@@ -301,21 +361,74 @@ private:
            _measurement_name == RAW_BH1750_STR;
   }
 
-  // ---- Serial input (polling mode) ----------------------------------------
-
-  void _handlePollingSerial() {
+  // ---- Serial input (interrupt mode) --------------------------------------
+  // update() routes here when _app_state == APP_INTERRUPT.
+  //
+  // This handler does the absolute minimum: blank, and mode switches.
+  // It never reads a sensor and never calls any display function.
+  // All measurement output is the exclusive responsibility of application code.
+  void _handleInterruptSerial() {
     if (!Serial.available()) return;
+
     char cmd = Serial.read();
     uint32_t now = millis();
-    if ((now - _last_button_ms) < DEBOUNCE_DT_MS) return;
+    if ((now - _last_button_ms) < 200) return;
     _last_button_ms = now;
 
     if (cmd == 'b') {
-      blankSensor();
+      blankSensor();                        // blanking is always permitted
+
     } else if (cmd == 'm') {
       _app_state = APP_MENU_DRIVEN;
       _mode      = MODE_MEASURE;
       Serial.println("Switched to menu-driven mode");
+
+    } else if (cmd == 'p') {
+      setAppState(APP_POLLING);
+
+    } else if (cmd == '?') {
+      Serial.println("INT: idle – call getters directly to read sensors");
+      Serial.println("INT: commands: b=blank  m=menu  p=polling  ?=help");
+    }
+  }
+
+  // ---- Serial input (polling mode) ----------------------------------------
+  // update() routes here when _app_state == APP_POLLING.
+  // Sensor reads and printing are NOT done here; they are gated in loop()
+  // via isPollingActive() / consumeOneShot().
+  void _handlePollingSerial() {
+    if (!Serial.available()) return;
+
+    char cmd = Serial.read();
+    // Light debounce – shorter than menu mode since single keystrokes matter
+    uint32_t now = millis();
+    if ((now - _last_button_ms) < 200) return;
+    _last_button_ms = now;
+
+    if (cmd == 's') {
+      _polling_state = POLLING_STREAM;
+      Serial.println("POLL: streaming ON  ('x' to stop, Enter for one-shot)");
+
+    } else if (cmd == 'x' || cmd == 'q') {
+      _polling_state = POLLING_IDLE;
+      Serial.println("POLL: idle  ('s' to stream, Enter for one-shot)");
+
+    } else if (cmd == '\n' || cmd == '\r') {
+      // One-shot: trigger a single read regardless of current stream state
+      _polling_state = POLLING_ONESHOT;
+
+    } else if (cmd == 'b') {
+      blankSensor();
+
+    } else if (cmd == 'm') {
+      // Switch back to full menu-driven mode
+      _app_state     = APP_MENU_DRIVEN;
+      _polling_state = POLLING_IDLE;
+      _mode          = MODE_MEASURE;
+      Serial.println("Switched to menu-driven mode");
+
+    } else if (cmd == '?') {
+      _printPollingHelp();
     }
   }
 
@@ -333,10 +446,8 @@ private:
 
       case MODE_MEASURE:
         if (cmd == 'p') {
-          _app_state = APP_POLLING;
-          Serial.println("Switched to polling mode");
+          setAppState(APP_POLLING);
           return;
-
         } else if (cmd == 'b' && !_isRawView()) {
           blankSensor();
 
@@ -480,6 +591,16 @@ private:
   void _postMessage(const String& msg, bool is_abort) {
     _pending_message  = msg;
     _pending_is_abort = is_abort;
+  }
+
+  void _printPollingHelp() {
+    Serial.println("POLL commands: s=stream  x=stop  Enter=one-shot  b=blank  m=menu  ?=help");
+    Serial.print  ("POLL state   : ");
+    switch (_polling_state) {
+      case POLLING_IDLE:    Serial.println("IDLE");    break;
+      case POLLING_STREAM:  Serial.println("STREAM");  break;
+      case POLLING_ONESHOT: Serial.println("ONESHOT"); break;
+    }
   }
 
   // Insertion-sort median
