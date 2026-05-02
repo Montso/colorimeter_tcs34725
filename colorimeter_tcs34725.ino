@@ -2,125 +2,164 @@
  * colorimeter_tcs34725.ino
  * ESP32-S3 Colorimeter – main sketch
  *
- * Target : ESP32-S3 with 8 MB flash
- * Sensor : TCS34725 (I2C) and / or BH1750 (I2C)
- * Storage: LittleFS on internal flash (no SD card required)
- *
- * First-time setup
- * ----------------
- * 1. In Arduino IDE select:
- *      Tools → Board    → ESP32S3 Dev Module
- *      Tools → Flash    → 8MB
- *      Tools → Partition Scheme → Default 4MB with spiffs  (or any scheme
- *              that includes a LittleFS/SPIFFS partition of at least 1 MB)
- *
- * 2. Install the ESP32 LittleFS filesystem uploader plugin:
- *      https://github.com/lorol/arduino-esp32fs-plugin
- *
- * 3. Place configuration.json and calibrations.json in a folder called
- *    "data" inside the sketch folder, then run:
- *      Tools → ESP32 LittleFS Data Upload
- *    This writes the files to the LittleFS partition once.  They persist
- *    across normal firmware uploads.
- *
- * 4. Upload this sketch.
- *
- * Libraries required (install via Library Manager)
- * -------------------------------------------------
- *   ArduinoJson       – Benoit Blanchon       (v6 or v7)
- *   Adafruit TCS34725 – Adafruit Industries
- *
  * ============================================================
- * APPLICATION MODE
+ *  MOCK / REAL HARDWARE SWITCH
  * ============================================================
- * Uncomment exactly one of the two lines below.
+ * Comment / uncomment ONE line to switch between real hardware
+ * and the isolated mock for application-code testing.
  *
- *   APP_MENU_DRIVEN  –  Full interactive serial menu.
- *                       Serial commands (115 200 baud, no line ending):
- *                         b  – blank sensor
- *                         m  – toggle menu
- *                         u  – menu up
- *                         d  – menu down
- *                         r  – select / right
- *                         g  – cycle gain          (raw TCS34725 mode only)
- *                         i  – cycle integration time (raw TCS34725 mode only)
- *                         p  – switch to polling mode at runtime
+ * When USE_MOCK_COLORIMETER is defined:
+ *   - No I2C, no LittleFS, no sensor libraries are used.
+ *   - A MockColorimeter object is substituted; it has an
+ *     identical public API so all loop() application code
+ *     compiles and runs unchanged.
+ *   - Select test scenarios via Serial at runtime (see below).
  *
- *   APP_POLLING      –  No menu.  update() keeps sensors refreshed; your
- *                       code calls public getters to read measurements.
- *                       Serial commands (115 200 baud):
- *                         b  – blank sensor
- *                         m  – return to menu-driven mode at runtime
+ * When USE_MOCK_COLORIMETER is NOT defined:
+ *   - Real TCS34725 + BH1750 sensors, LittleFS config files.
  * ============================================================
  */
+#define USE_MOCK_COLORIMETER          // ← comment out for real hardware
+// #undef USE_MOCK_COLORIMETER        // ← alternative explicit disable
 
-#define STARTUP_MODE APP_MENU_DRIVEN
-// #define STARTUP_MODE APP_POLLING
+// ============================================================
+//  APPLICATION MODE  (applies to both mock and real builds)
+// ============================================================
+//  APP_MENU_DRIVEN – full interactive serial menu
+//  APP_POLLING     – no menu; your code reads values via getters
+// ============================================================
+#define STARTUP_MODE APP_POLLING
 
+// ============================================================
+//  INCLUDES – conditional on mock vs. real
+// ============================================================
 #include <Arduino.h>
-#include <Wire.h>
-#include <LittleFS.h>
-#include "TCS34725_Colorimeter.h"
 
-Colorimeter colorimeter;
+#ifdef USE_MOCK_COLORIMETER
+  // ---- MOCK BUILD --------------------------------------------------------
+  // No hardware libraries needed. SensorCommon.h is the only dependency.
+  #include "SensorCommon.h"
+  #include "MockColorimeter.h"
+  MockColorimeter colorimeter;
 
+#else
+  // ---- REAL BUILD --------------------------------------------------------
+  // All three library includes must be here (not inside .h files) so the
+  // Arduino IDE library discovery compiles their .cpp implementations.
+  #include <Wire.h>
+  #include <LittleFS.h>
+  #include <ArduinoJson.h>
+  #include <Adafruit_TCS34725.h>
+  #include <BH1750.h>
+  #include "TCS34725_Colorimeter.h"
+  Colorimeter colorimeter;
+#endif
+
+// ===========================================================================
+//  setup()
+// ===========================================================================
 void setup() {
   Serial.begin(115200);
   delay(1500);
+  Serial.println("\n=== ESP32-S3 Colorimeter ===");
 
-  Serial.println("\n=== ESP32-S3 TCS34725 Colorimeter ===");
-
+#ifndef USE_MOCK_COLORIMETER
+  // LittleFS only needed for real build
   if (!LittleFS.begin(true)) {
-    Serial.println("FATAL: LittleFS mount failed");
-    Serial.println("Run 'ESP32 LittleFS Data Upload' from the Tools menu, then reset.");
+    Serial.println("FATAL: LittleFS mount failed – run ESP32 LittleFS Data Upload");
     while (true) { delay(1000); }
   }
   Serial.println("LittleFS mounted");
+#else
+  Serial.println("[MOCK] Hardware bypassed – running in mock mode");
+  // Optionally pre-select a scenario before begin():
+  // colorimeter.setScenario(MockScenario::RAMP);
+#endif
 
   if (!colorimeter.begin()) {
     Serial.println("Colorimeter init failed – running in abort mode");
-  } else {
-    colorimeter.setAppState(STARTUP_MODE);
+    return;
+  }
 
-    if (STARTUP_MODE == APP_POLLING) {
-      Serial.println("Colorimeter ready – POLLING mode");
-      Serial.println("Commands: b=blank  m=return to menu");
-    } else {
-      Serial.println("Colorimeter ready – MENU-DRIVEN mode");
-      Serial.println("Commands: b=blank  m=menu  u=up  d=down  r=select  p=polling mode");
-      Serial.println("          g=cycle gain  i=cycle itime  (last two: raw TCS34725 only)");
-    }
+  colorimeter.setAppState(STARTUP_MODE);
+
+#ifndef USE_MOCK_COLORIMETER
+  Serial.print("Primary sensor : ");
+  Serial.println(colorimeter.getPrimarySensor() == SENSOR_TYPE_BH1750
+                   ? "BH1750" : "TCS34725");
+  Serial.print("TCS34725 present: "); Serial.println(colorimeter.isTCSPresent()    ? "yes" : "no");
+  Serial.print("BH1750   present: "); Serial.println(colorimeter.isBH1750Present() ? "yes" : "no");
+#endif
+
+  if (STARTUP_MODE == APP_POLLING) {
+    Serial.println("Mode: POLLING – reading values in loop()");
+    Serial.println("Send 'b' to blank, 'm' to toggle display mode");
+  } else {
+    Serial.println("Mode: MENU-DRIVEN");
+    Serial.println("Commands: b=blank  m=menu  u=up  d=down  r=select");
   }
 }
 
+// ===========================================================================
+//  loop()
+//
+//  update() must always be called first – it handles Serial input and
+//  (in menu mode) prints the current measurement.  The application code
+//  below is only reached in POLLING mode.
+// ===========================================================================
 void loop() {
   colorimeter.update();
 
-#if STARTUP_MODE == APP_POLLING
-  // ---- Polling mode: read any measurement via public getters ---------------
-  //
-  // All getters are available regardless of which sensors are fitted.
-  // A return value of -1.0 signals an error or out-of-range condition.
-  // getTCSRaw() / getBH1750Raw() additionally return a SensorResult code.
+  // ---- POLLING MODE: application code goes here --------------------------
+  // This block is the part you are testing.  It calls only public getters
+  // and therefore compiles identically against MockColorimeter or Colorimeter.
+  if (colorimeter.getAppState() == APP_POLLING) {
 
-  float absorbance    = colorimeter.getAbsorbance();
-  float transmittance = colorimeter.getTransmittance();
+    // -- Absorbance & transmittance (primary sensor) -----------------------
+    float absorbance    = colorimeter.getAbsorbance();
+    float transmittance = colorimeter.getTransmittance();
 
-  float tcs_raw    = -1.0f;
-  float bh1750_raw = -1.0f;
-  SensorResult tcs_result    = SENSOR_IO_ERROR;
-  SensorResult bh1750_result = SENSOR_IO_ERROR;
+    // -- Per-sensor raw readings -------------------------------------------
+    float        tcs_raw    = -1.0f;
+    float        bh1750_raw = -1.0f;
+    SensorResult tcs_r      = SENSOR_IO_ERROR;
+    SensorResult bh1750_r   = SENSOR_IO_ERROR;
 
-  if (colorimeter.isTCSPresent())    tcs_result    = colorimeter.getTCSRaw(tcs_raw);
-  if (colorimeter.isBH1750Present()) bh1750_result = colorimeter.getBH1750Raw(bh1750_raw);
+    if (colorimeter.isTCSPresent())    tcs_r    = colorimeter.getTCSRaw(tcs_raw);
+    if (colorimeter.isBH1750Present()) bh1750_r = colorimeter.getBH1750Raw(bh1750_raw);
 
-  // Example output – replace with your own processing logic.
-  Serial.print("ABS:");   Serial.print(absorbance,    4);
-  Serial.print("  TRANS:"); Serial.print(transmittance, 4);
-  if (tcs_result    == SENSOR_OK) { Serial.print("  TCS:");  Serial.print(tcs_raw,    1); }
-  if (bh1750_result == SENSOR_OK) { Serial.print("  BH:");   Serial.print(bh1750_raw, 1); }
-  Serial.println();
-#endif
+    // -- Print results to Serial -------------------------------------------
+    // Replace this block with your own processing / display / logging logic.
+    Serial.print("ABS:");
+    if (absorbance < 0.0f) Serial.print("ERR ");
+    else                   { Serial.print(absorbance, 4); Serial.print(" "); }
 
+    Serial.print("  TRANS:");
+    if (transmittance < 0.0f) Serial.print("ERR ");
+    else                      { Serial.print(transmittance, 4); Serial.print(" "); }
+
+    Serial.print("  TCS:");
+    switch (tcs_r) {
+      case SENSOR_OK:       Serial.print(tcs_raw, 1);    break;
+      case SENSOR_OVERFLOW: Serial.print("OVF");         break;
+      default:              Serial.print("ERR");         break;
+    }
+
+    Serial.print("  BH:");
+    switch (bh1750_r) {
+      case SENSOR_OK:       Serial.print(bh1750_raw, 1); break;
+      case SENSOR_OVERFLOW: Serial.print("OVF");         break;
+      default:              Serial.print("ERR");         break;
+    }
+
+    Serial.print("  BLANK:");
+    Serial.print(colorimeter.getIsBlanked() ? "Y" : "N");
+
+    Serial.println();
+  }
+  #ifdef USE_MOCK_COLORIMETER
+  delay(MockColorimeter::LOOP_DT_MS);
+  #else
   delay(Colorimeter::LOOP_DT_MS);
+  #endif
 }
