@@ -25,12 +25,14 @@
 #include "LightSensor_BH1750.h"
 #include "Calibrations.h"
 #include "Configuration.h"
+#include "LEDController.h"
 
 enum OperatingMode : uint8_t {
-  MODE_MEASURE = 0,
-  MODE_MENU    = 1,
-  MODE_MESSAGE = 2,
-  MODE_ABORT   = 3
+  MODE_MEASURE     = 0,
+  MODE_MENU        = 1,
+  MODE_MESSAGE     = 2,
+  MODE_ABORT       = 3,
+  MODE_LED_CONTROL = 4   // LED brightness / on-off adjustment
 };
 
 // AppState controls what update() does each loop cycle.
@@ -91,7 +93,8 @@ public:
       _primary_sensor(SENSOR_TYPE_TCS34725),
       _tcs_ok(false),
       _bh1750_ok(false),
-      _pending_is_abort(false) {}
+      _pending_is_abort(false),
+      _led_selected(0) {}
 
   // ---- Lifecycle ----------------------------------------------------------
 
@@ -163,6 +166,9 @@ public:
       }
       _measurement_name = ABSORBANCE_STR;
     }
+
+    // LEDs – initialise independent of sensor / calibration state
+    _leds.begin();
 
     // Preliminary blank (set_blanked = false → UI shows "not blanked")
     blankSensor(false);
@@ -307,6 +313,10 @@ public:
   bool          isBH1750Present()    const { return _bh1750_ok; }
   SensorType    getPrimarySensor()   const { return _primary_sensor; }
 
+  // Direct access to the LED controller.  Fully independent of operating mode.
+  LEDController&       getLEDs()       { return _leds; }
+  const LEDController& getLEDs() const { return _leds; }
+
 private:
   LightSensor       _tcs;
   LightSensorBH1750 _bh1750;
@@ -333,6 +343,9 @@ private:
   String _pending_message;
   bool   _pending_is_abort;
 
+  LEDController _leds;          // independent of all measurement state
+  uint8_t       _led_selected;  // index of LED currently being adjusted (0 or 1)
+
   // ---- Menu ---------------------------------------------------------------
 
   void _buildMenuItems() {
@@ -344,6 +357,9 @@ private:
     if (_bh1750_ok) _menu_items.push_back(RAW_BH1750_STR);
     for (const auto& kv : _calibrations.getAllCalibrations()) {
       _menu_items.push_back(kv.first);
+    }
+    for (uint8_t i = 0; i < LEDController::NUM_LEDS; i++) {
+      _menu_items.push_back(LEDController::name(i));
     }
     _menu_items.push_back(ABOUT_STR);
   }
@@ -492,8 +508,20 @@ private:
             _postMessage(about, false);
             _mode = MODE_MESSAGE;
           } else {
-            _measurement_name = sel;
-            _mode = MODE_MEASURE;
+            // Check if selection is an LED item
+            bool is_led = false;
+            for (uint8_t i = 0; i < LEDController::NUM_LEDS; i++) {
+              if (sel == LEDController::name(i)) {
+                _led_selected = i;
+                _mode         = MODE_LED_CONTROL;
+                is_led        = true;
+                break;
+              }
+            }
+            if (!is_led) {
+              _measurement_name = sel;
+              _mode = MODE_MEASURE;
+            }
           }
         }
         break;
@@ -508,6 +536,13 @@ private:
 
       case MODE_ABORT:
         break;
+
+      case MODE_LED_CONTROL:
+        if      (cmd == 'u') _leds.stepUp(_led_selected);
+        else if (cmd == 'd') _leds.stepDown(_led_selected);
+        else if (cmd == 't') _leds.toggle(_led_selected);
+        else if (cmd == 'm' || cmd == 'r') _mode = MODE_MENU;
+        break;
     }
   }
 
@@ -515,10 +550,11 @@ private:
 
   void _updateDisplay() {
     switch (_mode) {
-      case MODE_MEASURE:  _displayMeasure(); break;
-      case MODE_MENU:     _displayMenu();    break;
-      case MODE_MESSAGE:  _displayMessage(); break;
-      case MODE_ABORT:    _displayAbort();   break;
+      case MODE_MEASURE:     _displayMeasure(); break;
+      case MODE_MENU:        _displayMenu();    break;
+      case MODE_MESSAGE:     _displayMessage(); break;
+      case MODE_ABORT:       _displayAbort();   break;
+      case MODE_LED_CONTROL: _displayLED();     break;
     }
   }
 
@@ -576,6 +612,17 @@ private:
       Serial.print(i == _menu_item_pos ? "> " : "  ");
       Serial.println(_menu_items[i]);
     }
+  }
+
+  void _displayLED() {
+    Serial.print(LEDController::name(_led_selected));
+    Serial.print("  GPIO ");
+    Serial.print(LEDController::pin(_led_selected));
+    Serial.print("  ");
+    Serial.print(_leds.getPercent(_led_selected));
+    Serial.print("%  ");
+    Serial.println(_leds.isOn(_led_selected) ? "[ON] " : "[OFF]");
+    Serial.println("  u=brighter  d=dimmer  t=toggle  m=back");
   }
 
   void _displayMessage() {

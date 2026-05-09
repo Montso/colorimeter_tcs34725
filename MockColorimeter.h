@@ -61,6 +61,7 @@
 #include <Arduino.h>
 #include <math.h>
 #include "SensorCommon.h"   // SensorResult – no hardware dependencies
+#include "LEDController.h"  // real LEDController; ledcAttach is always available on ESP32-S3
 
 // ---------------------------------------------------------------------------
 // Enums – mirrors of those defined in TCS34725_Colorimeter.h / Configuration.h
@@ -68,10 +69,11 @@
 // real sensor headers (which pull in I2C / Adafruit / BH1750 libraries).
 // ---------------------------------------------------------------------------
 enum OperatingMode : uint8_t {
-  MODE_MEASURE = 0,
-  MODE_MENU    = 1,
-  MODE_MESSAGE = 2,
-  MODE_ABORT   = 3
+  MODE_MEASURE     = 0,
+  MODE_MENU        = 1,
+  MODE_MESSAGE     = 2,
+  MODE_ABORT       = 3,
+  MODE_LED_CONTROL = 4
 };
 
 enum AppState : uint8_t {
@@ -80,12 +82,6 @@ enum AppState : uint8_t {
   APP_INTERRUPT   = 2   // fully idle; application code calls getters on its own schedule
 };
 
-enum PollingState : uint8_t {
-  POLLING_IDLE    = 0,
-  POLLING_STREAM  = 1,
-  POLLING_ONESHOT = 2
-};
- 
 enum SensorType : uint8_t {
   SENSOR_TYPE_TCS34725 = 0,
   SENSOR_TYPE_BH1750   = 1
@@ -176,7 +172,8 @@ public:
       _measurement_name(ABSORBANCE_STR),
       _is_blanked(false),
       _last_cmd_ms(0),
-      _scenario_start_ms(0) {}
+      _scenario_start_ms(0),
+      _led_selected(0) {}
 
   // ---- Lifecycle ----------------------------------------------------------
 
@@ -187,6 +184,7 @@ public:
     Serial.print  ("[MOCK] Scenario: "); Serial.println(s.label);
     Serial.print  ("[MOCK] TCS34725: "); Serial.println(s.tcs_present  ? "OK (mock)" : "absent");
     Serial.print  ("[MOCK] BH1750:   "); Serial.println(s.bh1750_present ? "OK (mock)" : "absent");
+    _leds.begin();
 
     if (!s.tcs_present && !s.bh1750_present) {
       Serial.println("[MOCK] ABORT: both sensors absent in this scenario");
@@ -204,13 +202,12 @@ public:
   // In APP_INTERRUPT mode it is a near-no-op: only the Serial command handler
   // runs (for blank and mode-switch), and nothing is printed or read.
   void update() {
-    _handle_serial();   // always check for scenario / mode commands
+    _handle_serial();
 
-    // Display only in menu-driven mode
-    if (_app_state == APP_MENU_DRIVEN && _mode == MODE_MEASURE) {
-      _display_measure();
+    if (_app_state == APP_MENU_DRIVEN) {
+      if (_mode == MODE_MEASURE)     _display_measure();
+      if (_mode == MODE_LED_CONTROL) _display_led();
     }
-    // APP_POLLING and APP_INTERRUPT produce no output from update() itself
   }
 
   // ---- Scenario control ---------------------------------------------------
@@ -341,6 +338,9 @@ public:
   bool          isBH1750Present()    const { return _seed().bh1750_present; }
   SensorType    getPrimarySensor()   const { return _seed().primary; }
 
+  LEDController&       getLEDs()       { return _leds; }
+  const LEDController& getLEDs() const { return _leds; }
+
 private:
   MockScenario  _scenario;
   AppState      _app_state;
@@ -351,6 +351,8 @@ private:
   uint32_t     _last_cmd_ms;
   uint32_t     _scenario_start_ms;
   float        _blank_value = 32000.0f;
+  LEDController _leds;
+  uint8_t       _led_selected;
 
   const MockSeed& _seed() const {
     return MOCK_SEEDS[static_cast<uint8_t>(_scenario)];
@@ -406,6 +408,15 @@ private:
     uint32_t now = millis();
     if ((now - _last_cmd_ms) < 200) return;
     _last_cmd_ms = now;
+
+    // ---- LED control (active when in MODE_LED_CONTROL) --------------------
+    if (_mode == MODE_LED_CONTROL) {
+      if      (cmd == 'u') _leds.stepUp(_led_selected);
+      else if (cmd == 'd') _leds.stepDown(_led_selected);
+      else if (cmd == 't') _leds.toggle(_led_selected);
+      else if (cmd == 'm' || cmd == 'r') _mode = MODE_MEASURE;
+      return;
+    }
 
     // ---- Polling-mode commands (highest priority) -------------------------
     if (_app_state == APP_POLLING) {
@@ -482,6 +493,18 @@ private:
     Serial.print(_seed().label);
     Serial.print("]");
     Serial.println();
+  }
+
+  void _display_led() {
+    Serial.print("[MOCK] ");
+    Serial.print(LEDController::name(_led_selected));
+    Serial.print("  GPIO ");
+    Serial.print(LEDController::pin(_led_selected));
+    Serial.print("  ");
+    Serial.print(_leds.getPercent(_led_selected));
+    Serial.print("%  ");
+    Serial.println(_leds.isOn(_led_selected) ? "[ON] " : "[OFF]");
+    Serial.println("[MOCK]   u=brighter  d=dimmer  t=toggle  m=back");
   }
 
   void _print_polling_help() {
