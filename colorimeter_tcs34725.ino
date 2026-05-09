@@ -1,9 +1,9 @@
 // colorimeter_tcs34725.ino  –  ESP32-S3 colorimeter sketch
-// See GUIDE.md for setup, wiring, modes, and mock scenarios.
+// See RADme.md for setup, wiring, modes, and mock scenarios.
 
 // ---- Build switches -------------------------------------------------------
-#define USE_MOCK_COLORIMETER   // comment out for real hardware
-#define STARTUP_MODE APP_POLLING // APP_INTERRUPT | APP_POLLING | APP_MENU_DRIVEN
+//#define USE_MOCK_COLORIMETER   // comment out for real hardware
+#define STARTUP_MODE APP_MENU_DRIVEN // APP_INTERRUPT | APP_POLLING | APP_MENU_DRIVEN
 
 // ---- Includes -------------------------------------------------------------
 #include <Arduino.h>
@@ -14,7 +14,7 @@
   MockColorimeter colorimeter;
 #else
   // Library includes must live here so the Arduino IDE discovers and
-  // compiles their .cpp files. See GUIDE.md § "Library discovery".
+  // compiles their .cpp files.
   #include <Wire.h>
   #include <LittleFS.h>
   #include <ArduinoJson.h>
@@ -25,7 +25,9 @@
 #endif
 
 // ---- Helpers --------------------------------------------------------------
-static void _readAndPrint() {
+static void _readSensors() {  
+
+  // ------------------------------
   float abs  = colorimeter.getAbsorbance();
   float tran = colorimeter.getTransmittance();
 
@@ -35,22 +37,8 @@ static void _readAndPrint() {
   if (colorimeter.isTCSPresent())    tcs_r = colorimeter.getTCSRaw(tcs_raw);
   if (colorimeter.isBH1750Present()) bh_r  = colorimeter.getBH1750Raw(bh_raw);
 
-  Serial.print("ABS:");
-  abs  < 0 ? Serial.print("ERR  ") : (Serial.print(abs,  4), Serial.print("  "));
-  Serial.print("TRANS:");
-  tran < 0 ? Serial.print("ERR  ") : (Serial.print(tran, 4), Serial.print("  "));
-
-  Serial.print("TCS:");
-  if      (tcs_r == SENSOR_OK)       Serial.print(tcs_raw, 1);
-  else if (tcs_r == SENSOR_OVERFLOW) Serial.print("OVF");
-  else                               Serial.print("ERR");
-
-  Serial.print("  BH:");
-  if      (bh_r == SENSOR_OK)       Serial.print(bh_raw, 1);
-  else if (bh_r == SENSOR_OVERFLOW) Serial.print("OVF");
-  else                              Serial.print("ERR");
-
-  Serial.print("  BLANK:"); Serial.println(colorimeter.getIsBlanked() ? "Y" : "N");
+  //--------------
+  // can send/save/frame data how you want after reading
 }
 
 // ---- setup() --------------------------------------------------------------
@@ -83,6 +71,10 @@ void setup() {
 #endif
 
   colorimeter.setAppState(STARTUP_MODE);
+
+  // turn led on
+  pinMode(5, OUTPUT);
+  digitalWrite(5, HIGH);
 }
 
 // ---- loop() ---------------------------------------------------------------
@@ -91,15 +83,16 @@ void loop() {
 
   // Interrupt mode: application code is sole initiator of sensor reads.
   if (colorimeter.getAppState() == APP_INTERRUPT) {
-    _readAndPrint();  // replace with your own trigger / processing logic
+    _readSensors();  // replace with your own read trigger / processing logic
   }
 
   // Polling mode: reads gated by 's' / Enter commands handled in update().
   if (colorimeter.getAppState() == APP_POLLING &&
       (colorimeter.isPollingActive() || colorimeter.consumeOneShot())) {
-    _readAndPrint();
+    _readSensors();
   }
 
+  // delay
   #ifdef USE_MOCK_COLORIMETER
   delay(MockColorimeter::LOOP_DT_MS);
   #else
