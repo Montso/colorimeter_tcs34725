@@ -78,6 +78,7 @@ public:
   static const String TRANSMITTANCE_STR;
   static const String RAW_TCS_STR;     // "Raw TCS34725"
   static const String RAW_BH1750_STR;  // "Raw BH1750"
+  static const String LED_CONTROL_STR; // "LED Control"
   static const String ABOUT_STR;
 
   Colorimeter()
@@ -358,9 +359,7 @@ private:
     for (const auto& kv : _calibrations.getAllCalibrations()) {
       _menu_items.push_back(kv.first);
     }
-    for (uint8_t i = 0; i < LEDController::NUM_LEDS; i++) {
-      _menu_items.push_back(LEDController::name(i));
-    }
+    _menu_items.push_back(LED_CONTROL_STR);
     _menu_items.push_back(ABOUT_STR);
   }
 
@@ -508,17 +507,11 @@ private:
             _postMessage(about, false);
             _mode = MODE_MESSAGE;
           } else {
-            // Check if selection is an LED item
-            bool is_led = false;
-            for (uint8_t i = 0; i < LEDController::NUM_LEDS; i++) {
-              if (sel == LEDController::name(i)) {
-                _led_selected = i;
-                _mode         = MODE_LED_CONTROL;
-                is_led        = true;
-                break;
-              }
-            }
-            if (!is_led) {
+            // Check for LED Control entry
+            if (sel == LED_CONTROL_STR) {
+              _led_selected = 0;          // default focus to LED 1
+              _mode         = MODE_LED_CONTROL;
+            } else {
               _measurement_name = sel;
               _mode = MODE_MEASURE;
             }
@@ -538,9 +531,12 @@ private:
         break;
 
       case MODE_LED_CONTROL:
-        if      (cmd == 'u') _leds.stepUp(_led_selected);
-        else if (cmd == 'd') _leds.stepDown(_led_selected);
-        else if (cmd == 't') _leds.toggle(_led_selected);
+        if      (cmd == '1')             _led_selected = 0;
+        else if (cmd == '2')             _led_selected = 1;
+        else if (cmd == '+' || cmd == 'u') _leds.stepUp(_led_selected);
+        else if (cmd == '-' || cmd == 'd') _leds.stepDown(_led_selected);
+        else if (cmd == 't')             _leds.toggle(_led_selected);
+        else if (cmd == 'a')             _leds.allOff();
         else if (cmd == 'm' || cmd == 'r') _mode = MODE_MENU;
         break;
     }
@@ -615,14 +611,26 @@ private:
   }
 
   void _displayLED() {
-    Serial.print(LEDController::name(_led_selected));
-    Serial.print("  GPIO ");
-    Serial.print(LEDController::pin(_led_selected));
-    Serial.print("  ");
-    Serial.print(_leds.getPercent(_led_selected));
-    Serial.print("%  ");
-    Serial.println(_leds.isOn(_led_selected) ? "[ON] " : "[OFF]");
-    Serial.println("  u=brighter  d=dimmer  t=toggle  m=back");
+    Serial.println("\n=== LED CONTROL ===");
+    for (uint8_t i = 0; i < LEDController::NUM_LEDS; i++) {
+      Serial.print(i == _led_selected ? " > " : "   ");
+      Serial.print(i + 1);
+      Serial.print("  ");
+      Serial.print(_leds.bar(i));
+      Serial.print("  ");
+      // Right-align percentage (3 chars)
+      uint8_t pct = _leds.getPercent(i);
+      if (pct < 100) Serial.print(' ');
+      if (pct <  10) Serial.print(' ');
+      Serial.print(pct);
+      Serial.print("%  ");
+      Serial.print(_leds.isOn(i) ? "ON " : "OFF");
+      Serial.print("  ");
+      Serial.print(LEDController::name(i));
+      Serial.print("  GPIO");
+      Serial.println(LEDController::pin(i));
+    }
+    Serial.println("   1/2=select  +/-=brightness  t=toggle  a=all off  m=back");
   }
 
   void _displayMessage() {
@@ -668,6 +676,7 @@ const String Colorimeter::ABSORBANCE_STR    = "Absorbance";
 const String Colorimeter::TRANSMITTANCE_STR = "Transmittance";
 const String Colorimeter::RAW_TCS_STR       = "Raw TCS34725";
 const String Colorimeter::RAW_BH1750_STR    = "Raw BH1750";
+const String Colorimeter::LED_CONTROL_STR   = "LED Control";
 const String Colorimeter::ABOUT_STR         = "About";
 
 #endif // COLORIMETER_H

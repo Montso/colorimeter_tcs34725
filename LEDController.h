@@ -28,7 +28,7 @@ public:
   static const uint8_t  PIN_LED2 = 5;     // intended for transmittance measurements
   static const uint32_t PWM_FREQ = 5000;  // Hz — above audible range, below ADC noise
   static const uint8_t  PWM_BITS = 8;     // 0–255 duty range
-  static const uint8_t  PWM_STEP = 25;    // ~10 % per up/down step
+  static const uint8_t  PWM_STEP = 13;    // ~5 % per up/down step
 
   // Human-readable names used by the menu and display
   static const char* name(uint8_t i) {
@@ -104,6 +104,16 @@ public:
   // Brightness as 0–100 % (rounded)
   uint8_t getPercent(uint8_t i) const {
     return _valid(i) ? static_cast<uint8_t>((_brightness[i] * 100u) / 255u) : 0;
+  }
+
+  // 10-character filled bar, e.g. "[#######   ]"
+  // Useful for Serial display without needing a separate rendering step.
+  String bar(uint8_t i) const {
+    uint8_t filled = _valid(i) ? (_brightness[i] * 10u) / 255u : 0;
+    String s = "[";
+    for (uint8_t c = 0; c < 10; c++) s += (c < filled) ? '#' : ' ';
+    s += "]";
+    return s;
   }
 
   // ---- Bulk helpers -------------------------------------------------------

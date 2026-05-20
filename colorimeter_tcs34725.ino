@@ -71,10 +71,9 @@ void setup() {
 #endif
 
   colorimeter.setAppState(STARTUP_MODE);
+  colorimeter.getLEDs().setOn(0, true);           // turn LED 1 on
+  colorimeter.getLEDs().setBrightness(0, 180);    // set LED 1 to ~70 %
 
-  // turn led on
-  pinMode(5, OUTPUT);
-  digitalWrite(5, HIGH);
 }
 
 // ---- loop() ---------------------------------------------------------------

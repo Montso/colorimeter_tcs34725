@@ -162,6 +162,7 @@ public:
   static const String TRANSMITTANCE_STR;
   static const String RAW_TCS_STR;
   static const String RAW_BH1750_STR;
+  static const String LED_CONTROL_STR;
   static const String ABOUT_STR;
 
   MockColorimeter()
@@ -411,9 +412,12 @@ private:
 
     // ---- LED control (active when in MODE_LED_CONTROL) --------------------
     if (_mode == MODE_LED_CONTROL) {
-      if      (cmd == 'u') _leds.stepUp(_led_selected);
-      else if (cmd == 'd') _leds.stepDown(_led_selected);
-      else if (cmd == 't') _leds.toggle(_led_selected);
+      if      (cmd == '1')               _led_selected = 0;
+      else if (cmd == '2')               _led_selected = 1;
+      else if (cmd == '+' || cmd == 'u') _leds.stepUp(_led_selected);
+      else if (cmd == '-' || cmd == 'd') _leds.stepDown(_led_selected);
+      else if (cmd == 't')               _leds.toggle(_led_selected);
+      else if (cmd == 'a')               _leds.allOff();
       else if (cmd == 'm' || cmd == 'r') _mode = MODE_MEASURE;
       return;
     }
@@ -496,15 +500,25 @@ private:
   }
 
   void _display_led() {
-    Serial.print("[MOCK] ");
-    Serial.print(LEDController::name(_led_selected));
-    Serial.print("  GPIO ");
-    Serial.print(LEDController::pin(_led_selected));
-    Serial.print("  ");
-    Serial.print(_leds.getPercent(_led_selected));
-    Serial.print("%  ");
-    Serial.println(_leds.isOn(_led_selected) ? "[ON] " : "[OFF]");
-    Serial.println("[MOCK]   u=brighter  d=dimmer  t=toggle  m=back");
+    Serial.println("\n[MOCK] === LED CONTROL ===");
+    for (uint8_t i = 0; i < LEDController::NUM_LEDS; i++) {
+      Serial.print(i == _led_selected ? " > " : "   ");
+      Serial.print(i + 1);
+      Serial.print("  ");
+      Serial.print(_leds.bar(i));
+      Serial.print("  ");
+      uint8_t pct = _leds.getPercent(i);
+      if (pct < 100) Serial.print(' ');
+      if (pct <  10) Serial.print(' ');
+      Serial.print(pct);
+      Serial.print("%  ");
+      Serial.print(_leds.isOn(i) ? "ON " : "OFF");
+      Serial.print("  ");
+      Serial.print(LEDController::name(i));
+      Serial.print("  GPIO");
+      Serial.println(LEDController::pin(i));
+    }
+    Serial.println("   1/2=select  +/-=brightness  t=toggle  a=all off  m=back");
   }
 
   void _print_polling_help() {
@@ -540,6 +554,7 @@ const String MockColorimeter::ABSORBANCE_STR    = "Absorbance";
 const String MockColorimeter::TRANSMITTANCE_STR = "Transmittance";
 const String MockColorimeter::RAW_TCS_STR       = "Raw TCS34725";
 const String MockColorimeter::RAW_BH1750_STR    = "Raw BH1750";
+const String MockColorimeter::LED_CONTROL_STR   = "LED Control";
 const String MockColorimeter::ABOUT_STR         = "About";
 
 #endif // MOCK_COLORIMETER_H
