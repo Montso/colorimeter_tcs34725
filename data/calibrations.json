@@ -1,5 +1,5 @@
 {
-  "FD&C Blue 1": {
+  "Food Dye": {
     "units": "mg/L",
     "led": "630",
     "fit_type": "polynomial",
