@@ -78,7 +78,8 @@ public:
       _tcs_ok(false),
       _bh1750_ok(false),
       _pending_is_abort(false),
-      _led_selected(0) {}
+      _led_selected(0),
+      _display_dirty(true) {}
 
   // ---- Lifecycle ----------------------------------------------------------
 
@@ -302,6 +303,7 @@ private:
 
   String _pending_message;
   bool   _pending_is_abort;
+  bool   _display_dirty;   // true = non-measure screen needs one redraw
 
   LEDController  _leds;
   uint8_t        _led_selected;
@@ -375,6 +377,7 @@ private:
     uint32_t now = millis();
     if ((now - _last_button_ms) < DEBOUNCE_DT_MS) return;
     _last_button_ms = now;
+    _display_dirty  = true;   // any accepted command may change what's on screen
 
     switch (_mode) {
 
@@ -432,13 +435,19 @@ private:
   // ---- Display ------------------------------------------------------------
 
   void _updateDisplay() {
+    if (_mode == MODE_MEASURE) {
+      _displayMeasure();   // always refresh – sensor value changes continuously
+      return;
+    }
+    if (!_display_dirty) return;
+    _display_dirty = false;
     switch (_mode) {
-      case MODE_MEASURE:      _displayMeasure(); break;
       case MODE_MENU:         _displayMenu();    break;
       case MODE_MESSAGE:      _displayMessage(); break;
       case MODE_ABORT:        _displayAbort();   break;
       case MODE_LED_CONTROL:  _displayLED();     break;
       case MODE_PUMP_CONTROL: _displayPump();    break;
+      default:                                   break;
     }
   }
 
@@ -544,6 +553,7 @@ private:
   void _postMessage(const String& msg, bool is_abort) {
     _pending_message  = msg;
     _pending_is_abort = is_abort;
+    _display_dirty    = true;
   }
 
   void _printPollingHelp() {
