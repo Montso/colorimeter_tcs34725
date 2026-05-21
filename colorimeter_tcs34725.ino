@@ -279,8 +279,19 @@ void flushAllToTransmit() {
 }
 
 static void _readSensors(float& abs, float& tran) {
-    abs  = colorimeter.getAbsorbance();
+    LEDController& leds = colorimeter.getLEDs();
+
+    // LED 0 (GPIO4, abs): on for 100 ms then read
+    leds.setOn(0, true);
+    delay(100);
+    abs = colorimeter.getAbsorbance();
+    leds.setOn(0, false);
+
+    // LED 1 (GPIO5, trans): on for 100 ms then read
+    leds.setOn(1, true);
+    delay(100);
     tran = colorimeter.getTransmittance();
+    leds.setOn(1, false);
 }
 
 // Build, encrypt, and return the 48-char hex packet for a sensor reading.
@@ -379,8 +390,9 @@ void setup() {
 #endif
 
     colorimeter.setAppState(STARTUP_MODE);
-    colorimeter.getLEDs().setOn(0, true);
-    colorimeter.getLEDs().setBrightness(0, 180);
+    colorimeter.getLEDs().setBrightness(0, 180);  // abs LED  – brightness stored, off until read
+    colorimeter.getLEDs().setBrightness(1, 180);  // trans LED – brightness stored, off until read
+    colorimeter.getLEDs().allOff();               // ensure both start off
     keyExpansion();
     delay(2000);
 
