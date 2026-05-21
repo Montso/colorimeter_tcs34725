@@ -62,6 +62,7 @@
 #include <math.h>
 #include "SensorCommon.h"   // SensorResult – no hardware dependencies
 #include "LEDController.h"  // real LEDController; ledcAttach is always available on ESP32-S3
+#include "PumpController.h" // real PumpController; digitalWrite always available on ESP32-S3
 
 // ---------------------------------------------------------------------------
 // Enums – mirrors of those defined in TCS34725_Colorimeter.h / Configuration.h
@@ -69,11 +70,12 @@
 // real sensor headers (which pull in I2C / Adafruit / BH1750 libraries).
 // ---------------------------------------------------------------------------
 enum OperatingMode : uint8_t {
-  MODE_MEASURE     = 0,
-  MODE_MENU        = 1,
-  MODE_MESSAGE     = 2,
-  MODE_ABORT       = 3,
-  MODE_LED_CONTROL = 4
+  MODE_MEASURE      = 0,
+  MODE_MENU         = 1,
+  MODE_MESSAGE      = 2,
+  MODE_ABORT        = 3,
+  MODE_LED_CONTROL  = 4,
+  MODE_PUMP_CONTROL = 5
 };
 
 enum AppState : uint8_t {
@@ -163,6 +165,7 @@ public:
   static const String RAW_TCS_STR;
   static const String RAW_BH1750_STR;
   static const String LED_CONTROL_STR;
+  static const String PUMP_CONTROL_STR;
   static const String ABOUT_STR;
 
   MockColorimeter()
@@ -186,6 +189,7 @@ public:
     Serial.print  ("[MOCK] TCS34725: "); Serial.println(s.tcs_present  ? "OK (mock)" : "absent");
     Serial.print  ("[MOCK] BH1750:   "); Serial.println(s.bh1750_present ? "OK (mock)" : "absent");
     _leds.begin();
+    _pump.begin();
 
     if (!s.tcs_present && !s.bh1750_present) {
       Serial.println("[MOCK] ABORT: both sensors absent in this scenario");
@@ -206,8 +210,9 @@ public:
     _handle_serial();
 
     if (_app_state == APP_MENU_DRIVEN) {
-      if (_mode == MODE_MEASURE)     _display_measure();
-      if (_mode == MODE_LED_CONTROL) _display_led();
+      if (_mode == MODE_MEASURE)      _display_measure();
+      if (_mode == MODE_LED_CONTROL)  _display_led();
+      if (_mode == MODE_PUMP_CONTROL) _display_pump();
     }
   }
 
@@ -342,6 +347,9 @@ public:
   LEDController&       getLEDs()       { return _leds; }
   const LEDController& getLEDs() const { return _leds; }
 
+  PumpController&       getPump()       { return _pump; }
+  const PumpController& getPump() const { return _pump; }
+
 private:
   MockScenario  _scenario;
   AppState      _app_state;
@@ -354,6 +362,7 @@ private:
   float        _blank_value = 32000.0f;
   LEDController _leds;
   uint8_t       _led_selected;
+  PumpController _pump;
 
   const MockSeed& _seed() const {
     return MOCK_SEEDS[static_cast<uint8_t>(_scenario)];
@@ -419,6 +428,15 @@ private:
       else if (cmd == 't')               _leds.toggle(_led_selected);
       else if (cmd == 'a')               _leds.allOff();
       else if (cmd == 'm' || cmd == 'r') _mode = MODE_MEASURE;
+      return;
+    }
+
+    // ---- Pump control (active when in MODE_PUMP_CONTROL) ------------------
+    if (_mode == MODE_PUMP_CONTROL) {
+      if      (cmd == '1') _pump.setState(PUMP_OFF);
+      else if (cmd == '2') _pump.setState(PUMP_WATER);
+      else if (cmd == '3') _pump.setState(PUMP_REAGENT);
+      else if (cmd == '4' || cmd == 'm') { _pump.setState(PUMP_TESTING); _mode = MODE_MEASURE; }
       return;
     }
 
@@ -521,6 +539,20 @@ private:
     Serial.println("   1/2=select  +/-=brightness  t=toggle  a=all off  m=back");
   }
 
+  void _display_pump() {
+    Serial.println("\n[MOCK] === PUMP CONTROL ===");
+    Serial.print("[MOCK] State : "); Serial.println(_pump.stateName());
+    Serial.print("[MOCK] Pump  : "); Serial.print(_pump.isPumpOn()  ? "ON " : "OFF");
+    Serial.print("  GPIO"); Serial.println(PumpController::PIN_PUMP);
+    Serial.print("[MOCK] Valve : "); Serial.print(_pump.isValveOn() ? "ON " : "OFF");
+    Serial.print("  GPIO"); Serial.println(PumpController::PIN_VALVE);
+    Serial.println("[MOCK]");
+    Serial.println("[MOCK]   1 = OFF      (pump off, valve off)");
+    Serial.println("[MOCK]   2 = WATER    (pump on,  valve off)");
+    Serial.println("[MOCK]   3 = REAGENT  (pump on,  valve on )");
+    Serial.println("[MOCK]   4 = TESTING  (pump off, valve off) → back to measure");
+  }
+
   void _print_polling_help() {
     Serial.println("[MOCK] POLL commands: s=stream  x=stop  Enter=one-shot  b=blank  m=menu  ?=help");
     Serial.print  ("[MOCK] POLL state   : ");
@@ -555,6 +587,7 @@ const String MockColorimeter::TRANSMITTANCE_STR = "Transmittance";
 const String MockColorimeter::RAW_TCS_STR       = "Raw TCS34725";
 const String MockColorimeter::RAW_BH1750_STR    = "Raw BH1750";
 const String MockColorimeter::LED_CONTROL_STR   = "LED Control";
+const String MockColorimeter::PUMP_CONTROL_STR  = "Pump Control";
 const String MockColorimeter::ABOUT_STR         = "About";
 
 #endif // MOCK_COLORIMETER_H
