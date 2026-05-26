@@ -391,6 +391,7 @@ private:
 
       case MODE_MENU:
         if      (cmd == 'm') { _mode = MODE_MEASURE; }
+        else if (cmd == 'x') { _pump.setState(PUMP_OFF); }
         else if (cmd == 'u') { if (_menu_item_pos > 0) { _menu_item_pos--; if (_menu_item_pos < _menu_view_pos) _menu_view_pos--; } }
         else if (cmd == 'd') { if (_menu_item_pos < (uint8_t)(_menu_items.size() - 1)) { _menu_item_pos++; if (_menu_item_pos >= _menu_view_pos + ITEMS_PER_SCREEN) _menu_view_pos++; } }
         else if (cmd == 'r') {
@@ -496,6 +497,11 @@ private:
 
   void _displayMenu() {
     Serial.println("\n=== MENU ===");
+    if (_pump.getState() != PUMP_OFF) {
+      Serial.print("  [pump:");
+      Serial.print(_pump.stateName());
+      Serial.println("  x=stop]");
+    }
     uint8_t end = min(
       static_cast<uint8_t>(_menu_view_pos + ITEMS_PER_SCREEN),
       static_cast<uint8_t>(_menu_items.size())
