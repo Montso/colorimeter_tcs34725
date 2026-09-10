@@ -1,8 +1,11 @@
-# Colorimeter – Developer Guide
+# Basic colorimeter and PAR reading project for a marine sensing prototype (EEE4113F design project).
 
-Target: ESP32-S3 with 8 MB flash.  
-Sensors: TCS34725 (I2C, address `0x29`) and/or BH1750 (I2C, `0x23` or `0x5C`).  
-Storage: LittleFS on internal flash — no SD card.
+This was a demonstrator prototype for a low-cost, continuous sampling test device for dissolved oxygen (colorimetry proxyn using TCS34725), turbidity, and PAR (BH1750 sensor) for marine sampling.
+
+The test hardware was hugely based off the open-source [Open Colorimetry Project](https://blog.iorodeo.com/open-colorimeter-product-guide/). Code was written in Arduino for ESP32-S3.
+
+<img width="850" height="600" alt="img1" src="https://github.com/user-attachments/assets/9db92729-b276-4d24-910d-91c05a8f208a" />
+<img width="850" alt="img2" src="https://github.com/user-attachments/assets/9c2be614-81f0-471b-b3e8-1ec35aa018a2" />
 
 ---
 
@@ -20,29 +23,6 @@ Storage: LittleFS on internal flash — no SD card.
 | `Calibrations.h` | Loads `calibrations.json` and applies polynomial curves. |
 | `data/configuration.json` | Device settings (uploaded to LittleFS). |
 | `data/calibrations.json` | Calibration curves (uploaded to LittleFS). |
-
----
-
-## First-time setup (real hardware)
-
-1. **Arduino IDE board settings**
-   - Board → `ESP32S3 Dev Module`
-   - Flash Size → `8MB`
-   - Partition Scheme → `Default 4MB with spiffs` (or any scheme with ≥ 1 MB LittleFS/SPIFFS partition)
-
-2. **Install libraries** via Library Manager
-   - `ArduinoJson` — Benoit Blanchon
-   - `Adafruit TCS34725` — Adafruit Industries
-   - `BH1750` — Christopher Laws
-
-3. **Upload filesystem data**  
-   Install the [ESP32 LittleFS uploader plugin](https://github.com/lorol/arduino-esp32fs-plugin), place `configuration.json` and `calibrations.json` in a `data/` folder inside the sketch folder, then run **Tools → ESP32 LittleFS Data Upload**. Files persist across normal firmware uploads.
-
-4. Upload the sketch.
-
-### Library discovery
-
-All three library `#include` directives (`ArduinoJson`, `Adafruit_TCS34725`, `BH1750`) must appear in the `.ino` file, not only inside `.h` files. The Arduino IDE scans the `.ino` to discover which library `.cpp` files to compile; includes buried in sketch headers are invisible to this scan and cause linker errors.
 
 ---
 
